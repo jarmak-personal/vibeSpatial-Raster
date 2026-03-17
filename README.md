@@ -2,6 +2,9 @@
 
 GPU-first raster processing for [vibeSpatial](https://github.com/jarmak-personal/vibeSpatial). Custom NVRTC kernels and CCCL primitives for every operation — algebra, focal, zonal stats, labeling, rasterize, polygonize — with CPU fallbacks via scipy and rasterio.
 
+> [!WARNING]
+> vibeSpatial-Raster is very early in development. Operations may be unoptimized or have multiple Host/Device transfers causing reduced performance. [File an issue](https://github.com/jarmak-personal/vibeSpatial-Raster/issues) if you hit a problem!
+
 ## Operations
 
 | Category | Operations | GPU Backend |
