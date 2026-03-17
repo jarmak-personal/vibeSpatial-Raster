@@ -32,11 +32,15 @@ io = [
 ]
 cu12 = [
   "vibespatial[cu12]",
+  "cuda-python>=12,<13",
+  "cuda-cccl[cu12]",
   "cupy-cuda12x>=13",
   "nvidia-nvimgcodec-cu12[all]>=0.6.0",
 ]
 cu13 = [
   "vibespatial[cu13]",
+  "cuda-python>=13",
+  "cuda-cccl[cu13]",
   "cupy-cuda13x>=14",
   "nvidia-nvimgcodec-cu13[all]>=0.7.0",
 ]
