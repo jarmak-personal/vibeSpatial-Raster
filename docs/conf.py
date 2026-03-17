@@ -1,9 +1,9 @@
 """Sphinx configuration for vibespatial-raster documentation."""
 
 project = "vibespatial-raster"
-copyright = "2025, vibespatial Contributors"
+copyright = "2026, vibespatial Contributors"
 author = "vibespatial Contributors"
-release = "0.1.0"
+release = "0.1.1"
 
 extensions = [
     "myst_parser",
