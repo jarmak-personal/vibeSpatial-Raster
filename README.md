@@ -23,7 +23,8 @@ GPU-first raster processing for [vibeSpatial](https://github.com/jarmak-personal
 ```bash
 pip install vibespatial-raster            # core (CPU-only, scipy fallback)
 pip install vibespatial-raster[io]        # + rasterio for GeoTIFF/COG
-pip install vibespatial-raster[gpu-io]    # + nvImageCodec + CuPy for GPU-native decode
+pip install vibespatial-raster[cu12]      # + CUDA 12, CuPy, nvImageCodec
+pip install vibespatial-raster[cu13]      # + CUDA 13, CuPy, nvImageCodec
 ```
 
 For development:

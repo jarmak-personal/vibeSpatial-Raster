@@ -98,4 +98,4 @@ when needed.
 Supported compressions: LZW, DEFLATE, JPEG-in-TIFF, JPEG2000-in-TIFF, uncompressed.
 Supported formats: GeoTIFF (including BigTIFF), JPEG2000 (JP2/J2K/HTJ2K).
 
-Install: `pip install nvidia-nvimgcodec-cu12[all]` or `uv sync --extra gpu-io`
+Install: `pip install vibespatial-raster[cu12]` or `pip install vibespatial-raster[cu13]`

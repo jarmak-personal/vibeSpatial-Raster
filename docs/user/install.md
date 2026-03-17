@@ -10,14 +10,10 @@ For raster IO:
 
 - rasterio 1.4+
 
-For GPU acceleration:
+For GPU acceleration (pick one):
 
-- NVIDIA GPU with CUDA 12.x
-- CuPy 13+
-
-For GPU-native IO:
-
-- nvidia-nvimgcodec (nvImageCodec)
+- **CUDA 12**: CuPy 13+, cuda-python 12.x, cuda-cccl, nvImageCodec
+- **CUDA 13**: CuPy 14+, cuda-python 13.x, cuda-cccl, nvImageCodec
 
 ## Install with pip
 
@@ -28,9 +24,15 @@ pip install vibespatial-raster
 # With rasterio for GeoTIFF/COG IO
 pip install vibespatial-raster[io]
 
-# With GPU-native decode (nvImageCodec + CuPy)
-pip install vibespatial-raster[gpu-io]
+# With GPU support (CUDA 12)
+pip install vibespatial-raster[cu12]
+
+# With GPU support (CUDA 13)
+pip install vibespatial-raster[cu13]
 ```
+
+The `cu12` and `cu13` extras are mutually exclusive — install one or the other.
+Both include CuPy, cuda-python, CCCL, and nvImageCodec for GPU-native IO.
 
 ## Install with uv
 
