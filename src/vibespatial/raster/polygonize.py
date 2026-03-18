@@ -27,7 +27,6 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticKind,
 )
 
-
 # ---------------------------------------------------------------------------
 # CPU baseline via rasterio.features.shapes
 # ---------------------------------------------------------------------------

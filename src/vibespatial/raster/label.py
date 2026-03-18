@@ -52,6 +52,7 @@ def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 100_000) -> bool:
     """Auto-dispatch heuristic: use GPU when available and image is large enough."""
     try:
         import cupy  # noqa: F401
+
         from vibespatial.cuda_runtime import get_cuda_runtime
 
         runtime = get_cuda_runtime()
@@ -141,7 +142,6 @@ def label_gpu(
         get_cuda_runtime,
         make_kernel_cache_key,
     )
-
     from vibespatial.raster.kernels.ccl import (
         INIT_LABELS_SOURCE,
         LOCAL_MERGE_4C_SOURCE,
@@ -396,7 +396,6 @@ def morphology_gpu(
         get_cuda_runtime,
         make_kernel_cache_key,
     )
-
     from vibespatial.raster.kernels.morphology import (
         BINARY_DILATE_KERNEL_SOURCE,
         BINARY_ERODE_KERNEL_SOURCE,

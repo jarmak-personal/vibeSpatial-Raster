@@ -129,6 +129,8 @@ def _try_nvimgcodec_read(path, *, bands, window, overview_level):
     try:
         from vibespatial.raster.nvimgcodec_io import (
             has_nvimgcodec_support as _check,
+        )
+        from vibespatial.raster.nvimgcodec_io import (
             nvimgcodec_read,
         )
 

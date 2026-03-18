@@ -20,7 +20,6 @@ from vibespatial.raster.buffers import (
     from_numpy,
 )
 
-
 # ---------------------------------------------------------------------------
 # NVRTC kernel source for per-pixel polygon rasterize
 # ---------------------------------------------------------------------------
@@ -229,8 +228,7 @@ def rasterize_gpu(
                 coord_cursor += n_h
                 rings_in_poly.append(coord_cursor)
 
-            for rc in rings_in_poly:
-                all_ring_offsets.append(rc)
+            all_ring_offsets.extend(rings_in_poly)
             ring_cursor += len(rings_in_poly)
 
             all_geom_offsets.append(ring_cursor)

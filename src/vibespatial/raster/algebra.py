@@ -18,7 +18,6 @@ from vibespatial.raster.buffers import (
 )
 from vibespatial.residency import Residency, TransferTrigger
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

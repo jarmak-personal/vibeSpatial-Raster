@@ -108,6 +108,7 @@ class TestNodataPropagation:
 class TestRasterApply:
     def test_sqrt(self, raster_a):
         import cupy as cp
+
         from vibespatial.raster.algebra import raster_apply
 
         result = raster_apply(raster_a, cp.sqrt)

@@ -30,8 +30,8 @@ _decoder = None
 def has_nvimgcodec_support() -> bool:
     """Return True if both nvImageCodec and CuPy are importable."""
     try:
-        import nvidia.nvimgcodec  # noqa: F401
         import cupy  # noqa: F401
+        import nvidia.nvimgcodec  # noqa: F401
 
         return True
     except Exception:

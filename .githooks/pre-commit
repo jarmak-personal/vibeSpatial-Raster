@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pre-commit hook: ruff lint + format check + zero-copy compliance.
+#
+# Install:  uv run python scripts/install_githooks.py
+# Skip:     git commit --no-verify  (use sparingly)
+
+set -euo pipefail
+
+# Collect staged .py files (excludes deleted files)
+STAGED=$(git diff --cached --name-only --diff-filter=d -- '*.py')
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+echo "pre-commit: ruff check (lint)"
+if ! uv run ruff check $STAGED; then
+    echo ""
+    echo "Lint errors found. Run 'uv run ruff check --fix' to auto-fix."
+    exit 1
+fi
+
+echo "pre-commit: ruff format --check"
+if ! uv run ruff format --check $STAGED; then
+    echo ""
+    echo "Format errors found. Run 'uv run ruff format' to auto-fix."
+    exit 1
+fi
+
+echo "pre-commit: zero-copy compliance (ZCOPY001-003)"
+if ! uv run python scripts/check_zero_copy.py --all; then
+    echo ""
+    echo "Zero-copy violation detected. See errors above."
+    exit 1
+fi

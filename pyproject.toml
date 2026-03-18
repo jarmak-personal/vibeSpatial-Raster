@@ -84,3 +84,30 @@ xfail_strict = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E",     # pycodestyle errors
+  "F",     # pyflakes
+  "W",     # pycodestyle warnings
+  "I",     # isort
+  "UP",    # pyupgrade
+  "B",     # flake8-bugbear
+  "PERF",  # perflint
+  "RUF",   # ruff-specific
+]
+ignore = [
+  "E501",    # line too long (formatter handles this)
+  "B007",    # unused loop variable
+  "B905",    # zip strict
+  "PERF401", # manual list comprehension
+  "RUF001",  # ambiguous unicode
+  "RUF002",  # ambiguous unicode docstring
+  "RUF003",  # ambiguous unicode comment
+  "RUF022",  # __all__ not sorted (we group by category)
+  "RUF046",  # int(round(...)) — redundant but clarifies intent
+  "RUF059",  # unused unpacked variable (noisy in tests with tuple returns)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vibespatial"]
