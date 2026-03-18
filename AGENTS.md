@@ -1,0 +1,169 @@
+# AGENTS.md — vibespatial-raster
+
+Guide for AI agents working in this repository.
+
+## What This Is
+
+GPU-first raster processing extension for [vibespatial](https://github.com/jarmak-personal/vibespatial). Installs as `vibespatial.raster` — a namespace package with independent versioning. Python 3.12+, Apache 2.0.
+
+**Core operations:** IO (GeoTIFF/COG), algebra (local + focal), zonal stats, rasterize (vector→raster), connected component labeling, morphology, polygonize (raster→vector).
+
+## Hard Constraints
+
+1. **NO cuCIM, NO CuPy ndimage.** All GPU ops use custom NVRTC kernels + CCCL primitives only.
+2. **Zero-copy pipeline.** Once data is on-device, ALL processing stays on-device. Only two transfers allowed: initial H→D and final D→H. No host/device ping-pong mid-pipeline.
+3. **CPU fallback for every GPU op.** scipy/rasterio provide the baseline. Tests validate GPU output matches CPU.
+4. **rasterio is optional.** Guard with `has_rasterio_support()`. Tests skip gracefully.
+5. **scipy is a core dependency** (CPU baseline for CCL, morphology).
+6. **OwnedRasterArray stores native dtype** (uint8, int16, float32, float64) — not always fp64.
+
+## Repository Layout
+
+```
+src/vibespatial/raster/
+├── __init__.py          # Lazy-import facade, public API (__all__)
+├── buffers.py           # OwnedRasterArray, GridSpec, ZonalSpec, PolygonizeSpec, from_numpy/from_device
+├── io.py                # Read/write via rasterio (HYBRID path)
+├── nvimgcodec_io.py     # GPU-native decode via nvImageCodec
+├── geokeys.py           # GeoTIFF GeoKey parsing
+├── algebra.py           # Local (add/sub/mul/div/apply/where/classify) + focal (convolve, gaussian, slope, aspect)
+├── zonal.py             # Zonal statistics via CCCL segmented reduce
+├── rasterize.py         # Vector-to-raster via NVRTC point-in-polygon kernel
+├── label.py             # Connected components (union-find) + morphology (erode/dilate/open/close/sieve)
+├── polygonize.py        # Raster-to-vector via marching-squares
+└── kernels/             # Raw NVRTC kernel source strings (NOT .cu files — Python strings)
+    ├── ccl.py           # Union-find init/merge/pointer-jump/relabel
+    ├── focal.py         # 2D convolution with shared-memory tiling
+    ├── morphology.py    # Binary erode/dilate with halo
+    └── polygonize.py    # Marching-squares classify + emit
+
+tests/                   # 8 test files (~2,300 lines), one per module
+scripts/
+└── check_zero_copy.py   # Zero-copy compliance linter (ZCOPY001-003)
+docs/                    # Sphinx + MyST documentation (user/ and dev/ guides)
+.claude/commands/
+└── gpu-kernel.md        # Detailed GPU kernel development guide (slash command)
+```
+
+## Build & Dev Setup
+
+```bash
+uv sync --group dev          # Install all dev dependencies
+```
+
+Build system: Hatchling via `pyproject.toml`. No Makefile.
+
+## Testing
+
+```bash
+uv run pytest                             # All CPU tests (no GPU needed)
+uv run pytest -m gpu                      # GPU-only (requires CUDA hardware)
+uv run pytest tests/test_raster_algebra.py  # Single module
+uv run pytest -v --tb=short               # Verbose
+```
+
+- GPU tests use `@pytest.mark.gpu` and auto-skip when CuPy is unavailable.
+- CI runs CPU tests only (no GPU hardware). **GPU tests must pass locally before merge.**
+- No conftest.py — fixtures are defined in individual test files.
+- Test patterns: CPU vs GPU comparison, roundtrip (write→read), nodata propagation, edge cases.
+
+## Linting & Formatting
+
+```bash
+uv run ruff check src/ tests/            # Lint
+uv run ruff check --fix src/ tests/      # Auto-fix
+uv run ruff format src/ tests/           # Format
+uv run ruff format --check src/ tests/   # Format check (CI uses this)
+```
+
+Ruff config in `pyproject.toml`: line-length 100, target py312. Rules: E, F, W, I, UP, B, PERF, RUF (with specific ignores — see pyproject.toml).
+
+## Pre-commit Hooks
+
+Located at `.githooks/pre-commit`. Run on staged `.py` files:
+1. `ruff check` (lint)
+2. `ruff format --check` (format)
+3. `scripts/check_zero_copy.py --all` (zero-copy compliance — ZCOPY001-003)
+
+The zero-copy linter detects device↔host anti-patterns. It has a violation baseline (`_VIOLATION_BASELINE = 2`) for known debt. IO boundary modules (io, nvimgcodec_io, geokeys) are excluded.
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/`):
+- **ci.yml** — pytest (CPU, no GPU) + ruff lint/format on Python 3.12 + 3.13
+- **release.yml** — manual version bump + tag
+- **docs.yml** — Sphinx docs build
+- **publish.yml** — PyPI publish
+
+## Architecture Patterns
+
+### Lazy Imports
+`__init__.py` uses `__getattr__` to defer imports of optional dependencies (rasterio, CuPy, nvImageCodec). New public functions must be added to both `__all__` and the `__getattr__` dispatcher.
+
+### GPU/CPU Dispatch
+Every public operation auto-dispatches:
+```python
+def my_op(raster, *, use_gpu: bool | None = None):
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)  # CuPy available + pixel count > threshold
+    return _my_op_gpu(raster) if use_gpu else _my_op_cpu(raster)
+```
+
+### OwnedRasterArray
+Central type — wraps raster data with HOST/DEVICE residency tracking, nodata sentinel, affine transform, CRS, and diagnostic events. Use `from_numpy()` / `from_device()` factories to create. Use `raster.move_to(Residency.DEVICE, ...)` for transfers.
+
+### NVRTC Kernel Launch (7-step pattern)
+```python
+from vibespatial.cuda_runtime import (
+    get_cuda_runtime, make_kernel_cache_key,
+    KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_F64,
+)
+runtime = get_cuda_runtime()
+cache_key = make_kernel_cache_key("name", SOURCE)
+kernels = runtime.compile_kernels(cache_key=cache_key, source=SOURCE, kernel_names=("name",))
+params = ((ptr, width, height), (KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32))
+block = (256, 1, 1)
+grid = ((n + 255) // 256, 1, 1)
+runtime.launch(kernel=kernels["name"], grid=grid, block=block, params=params)
+```
+
+Use named constants (`KERNEL_PARAM_PTR`, `KERNEL_PARAM_I32`, `KERNEL_PARAM_F64`) — plain `ctypes.c_int` will fail.
+
+### CCCL Primitives (prefer over custom kernels)
+```python
+from vibespatial.cccl_primitives import (
+    segmented_reduce_sum, segmented_reduce_min, segmented_reduce_max,
+    segmented_sort, exclusive_sum, three_way_partition,
+    counting_iterator, transform_iterator,
+)
+```
+Direct `cuda.compute` API available for unwrapped primitives (radix_sort, unique_by_key, histogram_even).
+
+### Kernel Source Convention
+NVRTC kernel sources live in `kernels/*.py` as Python string constants (e.g., `CONVOLVE_2D_KERNEL_SOURCE`). They are NOT `.cu` files. Each file groups related kernels.
+
+### Diagnostic Events
+All GPU operations log `RasterDiagnosticEvent` with kind, detail string, residency, timing, and byte counts.
+
+## Adding a New Operation
+
+1. **Implement** in the appropriate module (or new module if needed).
+2. **CPU fallback** — always provide a scipy/numpy CPU path.
+3. **GPU path** — NVRTC kernel or CCCL primitive, following zero-copy rules.
+4. **Export** — add to `__all__` and `__getattr__` in `__init__.py`.
+5. **Test** — CPU test (always runs) + `@pytest.mark.gpu` test that validates GPU matches CPU.
+6. **Diagnostics** — append `RasterDiagnosticEvent` to the result.
+7. **Zero-copy compliance** — run `uv run python scripts/check_zero_copy.py --all` and ensure no new violations.
+
+## GPU Kernel Development
+
+For detailed kernel patterns (shared-memory tiling, stencil ops, CCL union-find, marching squares), GPU saturation techniques (occupancy, coalescing, fusion), and cooperative primitives (`cuda.coop`), see `.claude/commands/gpu-kernel.md`.
+
+## Common Pitfalls
+
+- **Don't use `ctypes.c_int` directly** for kernel params — use the named constants from `vibespatial.cuda_runtime`.
+- **Don't transfer data to host mid-pipeline** — the zero-copy linter will catch this (ZCOPY001-003).
+- **Don't import CuPy at module level** — use lazy imports or guard with try/except.
+- **Don't forget to update `__init__.py`** when adding new public functions.
+- **Kernel sources are Python strings**, not `.cu` files — don't create standalone CUDA files.
+- **Tests without GPU must still pass** — use `pytest.mark.gpu` skip decorators, not hard failures.
