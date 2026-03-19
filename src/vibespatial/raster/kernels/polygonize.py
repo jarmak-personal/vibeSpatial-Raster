@@ -73,19 +73,23 @@ extern "C" __global__ void classify_cells(
     int nd_bl = (nodata_mask != nullptr) ? nodata_mask[bl] : 0;
     int nd_br = (nodata_mask != nullptr) ? nodata_mask[br] : 0;
 
-    // If TL is nodata, this cell is trivial (class 0, no edges)
-    if (nd_tl) {
+    // If ALL corners are nodata, this cell is trivial (class 0, no edges)
+    if (nd_tl && nd_tr && nd_bl && nd_br) {
         cell_class[idx] = 0;
         cell_value[idx] = 0.0;
         return;
     }
 
-    // Reference value is TL corner
-    double ref = v_tl;
+    // Reference value is the first non-nodata corner (priority: TL, TR, BL, BR)
+    double ref;
+    if      (!nd_tl) ref = v_tl;
+    else if (!nd_tr) ref = v_tr;
+    else if (!nd_bl) ref = v_bl;
+    else             ref = v_br;
 
     // Classify corners: does each corner match the reference value?
     // Nodata corners do NOT match.
-    int match_tl = 1;  // always matches itself
+    int match_tl = (!nd_tl && v_tl == ref) ? 1 : 0;
     int match_tr = (!nd_tr && v_tr == ref) ? 1 : 0;
     int match_br = (!nd_br && v_br == ref) ? 1 : 0;
     int match_bl = (!nd_bl && v_bl == ref) ? 1 : 0;

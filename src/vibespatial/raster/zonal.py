@@ -220,6 +220,7 @@ def _zonal_stats_gpu(
         segmented_reduce_max,
         segmented_reduce_min,
         segmented_reduce_sum,
+        segmented_sort,
         sort_pairs,
         unique_sorted_pairs,
     )
@@ -404,8 +405,20 @@ def _zonal_stats_gpu(
             results_device["std"] = d_std
 
         elif stat is ZonalStatistic.MEDIAN:
-            # Values are already sorted within segments; extract median
-            # via NVRTC kernel that indexes the middle element(s)
+            # sort_pairs sorted by zone_id only; values within each
+            # segment are NOT yet sorted.  Use CCCL segmented_sort to
+            # sort values within each zone segment before extracting
+            # the median.
+            seg_sort_result = segmented_sort(
+                d_sorted_values,
+                starts=d_starts,
+                ends=d_ends,
+                num_segments=n_zones,
+            )
+            d_seg_sorted_values = seg_sort_result.keys
+
+            # Extract median via NVRTC kernel that indexes the middle
+            # element(s) of the now-sorted segments.
             runtime = get_cuda_runtime()
             cache_key = make_kernel_cache_key("extract_median", _MEDIAN_KERNEL_SOURCE)
             kernels = runtime.compile_kernels(
@@ -420,7 +433,7 @@ def _zonal_stats_gpu(
 
             params = (
                 (
-                    d_sorted_values.data.ptr,
+                    d_seg_sorted_values.data.ptr,
                     d_starts.data.ptr,
                     d_ends.data.ptr,
                     d_median.data.ptr,

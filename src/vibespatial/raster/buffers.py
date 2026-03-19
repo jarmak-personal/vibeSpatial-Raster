@@ -10,6 +10,7 @@ ADR-0036: Owned Raster Buffer Schema
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -278,6 +279,13 @@ class OwnedRasterArray:
         if self.nodata is None:
             return np.zeros(self.data.shape, dtype=bool)
         if np.isnan(self.nodata):
+            if not np.issubdtype(self.data.dtype, np.floating):
+                warnings.warn(
+                    f"nodata is NaN but data dtype is {self.data.dtype}; "
+                    "NaN cannot exist in integer arrays so mask is all-False",
+                    stacklevel=2,
+                )
+                return np.zeros(self.data.shape, dtype=bool)
             return np.isnan(self.data)
         return self.data == self.nodata
 
@@ -428,7 +436,15 @@ class OwnedRasterArray:
         if self.nodata is None:
             mask = cp.zeros(state.data.shape, dtype=cp.bool_)
         elif np.isnan(self.nodata):
-            mask = cp.isnan(state.data)
+            if not np.issubdtype(self.dtype, np.floating):
+                warnings.warn(
+                    f"nodata is NaN but data dtype is {self.dtype}; "
+                    "NaN cannot exist in integer arrays so mask is all-False",
+                    stacklevel=2,
+                )
+                mask = cp.zeros(state.data.shape, dtype=cp.bool_)
+            else:
+                mask = cp.isnan(state.data)
         else:
             mask = state.data == self.nodata
         self.device_state = RasterDeviceState(data=state.data, nodata_mask=mask)
@@ -509,6 +525,12 @@ def from_numpy(
     if data.ndim not in (2, 3):
         raise ValueError(f"raster data must be 2D or 3D, got {data.ndim}D")
 
+    if nodata is not None and np.isnan(nodata) and not np.issubdtype(data.dtype, np.floating):
+        raise ValueError(
+            f"nodata=NaN is incompatible with integer dtype {data.dtype}; "
+            "use a finite sentinel value or cast to a floating-point dtype"
+        )
+
     arr = OwnedRasterArray(
         data=np.ascontiguousarray(data),
         nodata=nodata,
@@ -516,16 +538,17 @@ def from_numpy(
         affine=affine,
         crs=crs,
         residency=Residency.HOST,
-        diagnostics=[
-            RasterDiagnosticEvent(
-                kind=RasterDiagnosticKind.CREATED,
-                detail=f"from_numpy shape={data.shape} dtype={data.dtype}",
-                residency=Residency.HOST,
-            )
-        ],
+        diagnostics=[],
     )
     if residency is Residency.DEVICE:
         arr.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST)
+    arr.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.CREATED,
+            detail=f"from_numpy shape={data.shape} dtype={data.dtype}",
+            residency=residency,
+        )
+    )
     return arr
 
 

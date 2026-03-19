@@ -420,8 +420,11 @@ def morphology_gpu(
 
     # Build binary foreground mask
     binary = (data != 0).astype(np.uint8)
-    if raster.nodata is not None and not np.isnan(raster.nodata):
-        binary &= (data != raster.nodata).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            binary &= (~np.isnan(data)).astype(np.uint8)
+        else:
+            binary &= (data != raster.nodata).astype(np.uint8)
 
     # H->D transfer
     d_input = cp.asarray(np.ascontiguousarray(binary.ravel()))
@@ -712,8 +715,11 @@ def _morphology_cpu(
         data = data[0]
 
     binary = data != 0
-    if raster.nodata is not None and not np.isnan(raster.nodata):
-        binary &= data != raster.nodata
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            binary &= ~np.isnan(data)
+        else:
+            binary &= data != raster.nodata
 
     structure = _structure_for_connectivity(connectivity)
     result_data = ops[operation](binary, structure=structure, iterations=iterations)

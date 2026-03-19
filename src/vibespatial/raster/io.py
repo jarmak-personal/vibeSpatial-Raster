@@ -97,7 +97,7 @@ def read_raster_metadata(path: str | Path) -> RasterMetadata:
             width=src.width,
             band_count=src.count,
             dtype=np.dtype(src.dtypes[0]),
-            nodata=float(nodata) if nodata is not None else None,
+            nodata=np.dtype(src.dtypes[0]).type(nodata) if nodata is not None else None,
             affine=_affine_to_tuple(src.transform),
             crs=_extract_crs(src),
             driver=src.driver,
@@ -193,7 +193,7 @@ def _read_raster_rasterio(path, *, bands, window, overview_level, residency):
 
     result = from_numpy(
         data,
-        nodata=float(nodata) if nodata is not None else None,
+        nodata=data.dtype.type(nodata) if nodata is not None else None,
         affine=affine,
         crs=crs,
         residency=residency,

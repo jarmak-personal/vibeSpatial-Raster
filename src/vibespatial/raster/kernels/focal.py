@@ -24,7 +24,7 @@ extern "C" __global__ void convolve_2d(
 
     if (col >= width || row >= height) return;
 
-    int idx = row * width + col;
+    long long idx = (long long)row * width + col;
 
     if (nodata_mask != nullptr && nodata_mask[idx]) {
         output[idx] = nodata_val;
@@ -44,7 +44,7 @@ extern "C" __global__ void convolve_2d(
                 continue;
             }
 
-            int src_idx = src_row * width + src_col;
+            long long src_idx = (long long)src_row * width + src_col;
 
             if (nodata_mask != nullptr && nodata_mask[src_idx]) {
                 continue;
@@ -57,7 +57,7 @@ extern "C" __global__ void convolve_2d(
     }
 
     if (weight_sum > 0.0) {
-        output[idx] = sum / weight_sum * (kw * kh > 1 ? weight_sum : 1.0);
+        output[idx] = sum / weight_sum;
     } else {
         output[idx] = nodata_val;
     }
@@ -82,7 +82,7 @@ extern "C" __global__ void convolve_normalized(
 
     if (col >= width || row >= height) return;
 
-    int idx = row * width + col;
+    long long idx = (long long)row * width + col;
 
     if (nodata_mask != nullptr && nodata_mask[idx]) {
         output[idx] = nodata_val;
@@ -102,7 +102,7 @@ extern "C" __global__ void convolve_normalized(
                 continue;
             }
 
-            int src_idx = src_row * width + src_col;
+            long long src_idx = (long long)src_row * width + src_col;
 
             if (nodata_mask != nullptr && nodata_mask[src_idx]) {
                 continue;

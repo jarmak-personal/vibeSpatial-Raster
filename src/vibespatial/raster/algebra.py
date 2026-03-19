@@ -101,7 +101,9 @@ def raster_divide(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
         with np.errstate(divide="ignore", invalid="ignore"):
             result = cp.true_divide(da, db)
         # Replace inf/nan from div-by-zero with nodata
-        nodata_val = a.nodata if a.nodata is not None else 0.0
+        nodata_val = (
+            a.nodata if a.nodata is not None else (b.nodata if b.nodata is not None else 0.0)
+        )
         bad = cp.logical_or(cp.isinf(result), cp.isnan(result))
         result = cp.where(bad, nodata_val, result)
         return result
@@ -241,26 +243,22 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
     )
     from vibespatial.raster.kernels.focal import CONVOLVE_NORMALIZED_KERNEL_SOURCE
 
-    data = raster.to_numpy().astype(np.float64)
-    if data.ndim == 3:
-        data = data[0]
+    d_data = _to_device_data(raster).astype(cp.float64)
+    if d_data.ndim == 3:
+        d_data = d_data[0]
 
-    height, width = data.shape
+    height, width = d_data.shape
     kh, kw = kernel_weights.shape
     pad_y, pad_x = kh // 2, kw // 2
 
-    d_input = cp.asarray(data)
+    d_input = d_data
     d_output = cp.zeros_like(d_input)
     d_kernel = cp.asarray(kernel_weights.astype(np.float64))
 
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     if raster.nodata is not None:
-        if np.isnan(raster.nodata):
-            nodata_host = np.isnan(data).astype(np.uint8)
-        else:
-            nodata_host = (data == raster.nodata).astype(np.uint8)
-        d_nodata = cp.asarray(nodata_host)
+        d_nodata = raster.device_nodata_mask().astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
         nodata_ptr = 0  # nullptr
@@ -390,6 +388,7 @@ def raster_slope(dem: OwnedRasterArray) -> OwnedRasterArray:
     """
     import cupy as cp
 
+    orig_dtype = dem.dtype
     data = dem.to_numpy().astype(np.float64)
     if data.ndim == 3:
         data = data[0]
@@ -429,6 +428,10 @@ def raster_slope(dem: OwnedRasterArray) -> OwnedRasterArray:
         nodata_mask = dem.nodata_mask
         host_result[nodata_mask] = dem.nodata
 
+    # Restore original dtype for float inputs (float32 in -> float32 out)
+    if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+        host_result = host_result.astype(orig_dtype)
+
     return from_numpy(
         host_result,
         nodata=dem.nodata,
@@ -447,6 +450,7 @@ def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
     """
     import cupy as cp
 
+    orig_dtype = dem.dtype
     data = dem.to_numpy().astype(np.float64)
     if data.ndim == 3:
         data = data[0]
@@ -474,6 +478,10 @@ def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
     if dem.nodata is not None:
         nodata_mask = dem.nodata_mask
         host_result[nodata_mask] = dem.nodata
+
+    # Restore original dtype for float inputs (float32 in -> float32 out)
+    if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+        host_result = host_result.astype(orig_dtype)
 
     return from_numpy(
         host_result,

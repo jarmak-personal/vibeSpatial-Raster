@@ -225,10 +225,7 @@ def _chain_edges_to_rings(
                 if not found:
                     break
 
-            if len(ring) >= 4:  # minimum polygon: 3 vertices + closing vertex
-                # Ensure ring is closed
-                if ring[0] != ring[-1]:
-                    ring.append(ring[0])
+            if current_end == ring_start and len(ring) >= 4:
                 rings.append(ring)
 
         if rings:
