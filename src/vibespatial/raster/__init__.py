@@ -12,7 +12,7 @@ Install: pip install vibespatial-raster
 Usage:   from vibespatial.raster import read_raster, zonal_stats
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from vibespatial.raster.buffers import (
     GridSpec,
