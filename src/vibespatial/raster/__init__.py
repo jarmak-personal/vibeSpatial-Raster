@@ -106,6 +106,8 @@ __all__ = [
     "raster_cumulative_distribution",
     "raster_histogram_equalize",
     "raster_percentile",
+    # Hydrology
+    "raster_fill_sinks",
     # NVRTC cache management (from vibespatial.cuda_runtime)
     "clear_nvrtc_cache",
     "nvrtc_cache_stats",
@@ -207,6 +209,11 @@ def __getattr__(name):
         from vibespatial.raster import histogram
 
         return getattr(histogram, name)
+    # Hydrology
+    if name in ("raster_fill_sinks",):
+        from vibespatial.raster import hydrology
+
+        return getattr(hydrology, name)
     # NVRTC cache management
     if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
         from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats
