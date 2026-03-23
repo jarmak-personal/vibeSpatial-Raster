@@ -373,40 +373,82 @@ void stencil_3x3(
 
 ### Iterative Convergence Kernel (CCL Union-Find)
 ```c
-// Phase 1: Initialize labels
-extern "C" __global__
-void init_labels(int* labels, const unsigned char* foreground, int n) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    labels[idx] = foreground[idx] ? idx : -1;
+// Path-splitting find_root: compresses tree in-place via atomicCAS
+__device__ int find_root(int* __restrict__ labels, int idx) {{
+    int root = idx;
+    while (true) {{
+        int parent = labels[root];
+        if (parent == root) return root;
+        int grandparent = labels[parent];
+        if (grandparent != parent)
+            atomicCAS(&labels[root], parent, grandparent);  // path split
+        root = parent;
+    }}
 }}
 
-// Phase 2: Local merge with atomicMin
+// Lock-free union via atomicCAS (replaces atomicMin)
+__device__ void union_roots(int* __restrict__ labels, int a, int b) {{
+    while (a != b) {{
+        if (a > b) {{ int t = a; a = b; b = t; }}
+        int old = atomicCAS(&labels[b], b, a);
+        if (old == b) return;  // success
+        a = find_root(labels, a);
+        b = find_root(labels, old);
+    }}
+}}
+
+// Phase 1: Initialize labels (grid-stride loop)
 extern "C" __global__
-void local_merge(int* labels, const unsigned char* foreground,
-                 int width, int height, int* changed) {{
+void init_labels(int* __restrict__ labels,
+                 const unsigned char* __restrict__ foreground, int n) {{
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n; idx += stride)
+        labels[idx] = foreground[idx] ? idx : -1;
+}}
+
+// Phase 2: Local merge — asymmetric scan (right+down only for 4C)
+extern "C" __global__
+void local_merge_4c(int* __restrict__ labels,
+                    const unsigned char* __restrict__ fg,
+                    int width, int height, int* __restrict__ changed) {{
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     if (col >= width || row >= height) return;
     int idx = row * width + col;
-    if (!foreground[idx]) return;
-
-    int my_label = labels[idx];
-    // Check 4-connected neighbors, atomicMin for merge
+    if (!fg[idx]) return;
+    int r = find_root(labels, idx);
+    // Right neighbor
+    if (col + 1 < width && fg[idx + 1]) {{
+        int nr = find_root(labels, idx + 1);
+        if (r != nr) {{ union_roots(labels, r, nr); *changed = 1; }}
+    }}
+    // Down neighbor
+    if (row + 1 < height && fg[idx + width]) {{
+        int nr = find_root(labels, idx + width);
+        if (r != nr) {{ union_roots(labels, r, nr); *changed = 1; }}
+    }}
 }}
 
-// Phase 3: Pointer jumping (path compression)
+// Phase 3: Bounded pointer jumping (multi-hop with safety limit)
 extern "C" __global__
-void pointer_jump(int* labels, int n, int* changed) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    if (labels[idx] < 0) return;
-
-    int label = labels[idx];
-    int root = labels[label];
-    if (root != label) {{
-        labels[idx] = root;
-        *changed = 1;
+void pointer_jump(int* __restrict__ labels, int n,
+                  int* __restrict__ changed) {{
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n; idx += stride) {{
+        int label = labels[idx];
+        if (label < 0) continue;
+        int root = label;
+        for (int hop = 0; hop < 64; hop++) {{
+            int parent = labels[root];
+            if (parent == root) break;
+            root = parent;
+        }}
+        if (root != label) {{
+            labels[idx] = root;
+            *changed = 1;
+        }}
     }}
 }}
 ```
