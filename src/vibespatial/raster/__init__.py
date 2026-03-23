@@ -77,6 +77,9 @@ __all__ = [
     "morphology_gpu",
     "sieve_filter",
     "raster_morphology",
+    "raster_morphology_tophat",
+    "raster_morphology_blackhat",
+    "make_structuring_element",
     # Polygonize
     "polygonize_owned",
     "polygonize_gpu",
@@ -135,6 +138,9 @@ def __getattr__(name):
         "morphology_gpu",
         "sieve_filter",
         "raster_morphology",
+        "raster_morphology_tophat",
+        "raster_morphology_blackhat",
+        "make_structuring_element",
     ):
         from vibespatial.raster import label
 
