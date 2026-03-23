@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Known pre-existing violations.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 2  # label_gpu ping-pong + zonal asnumpy-in-loop
+_VIOLATION_BASELINE = 1  # morphology_gpu to_numpy at pipeline start
 
 # Method names that pull data from device to host.
 # Note: .get() is excluded — it's the old CuPy scalar API but collides with

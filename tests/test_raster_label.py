@@ -188,6 +188,7 @@ class TestRasterMorphology:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestLabelGPU:
     """GPU CCL tests -- skipped when CuPy is not available."""
@@ -406,6 +407,7 @@ class TestLabelGPU:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestMorphologyGPU:
     """GPU morphology tests -- compare GPU kernels against CPU (scipy) baseline."""

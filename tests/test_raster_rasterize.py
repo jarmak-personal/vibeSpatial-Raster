@@ -78,6 +78,7 @@ class TestRasterizeCPU:
         assert (data == simple_grid.fill_value).all()
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 class TestRasterizeGPU:
     def test_basic(self, simple_grid, two_boxes):

@@ -26,6 +26,7 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
 )
+from vibespatial.residency import Residency, TransferTrigger
 
 # ---------------------------------------------------------------------------
 # CPU baseline via rasterio.features.shapes
@@ -321,14 +322,29 @@ def polygonize_gpu(
 ) -> tuple[list, list]:
     """Polygonize a raster using GPU marching-squares kernels.
 
-    Pipeline:
-      1. Transfer raster to device
-      2. classify_cells kernel — classify each 2x2 cell (one thread per cell)
+    Pipeline (per unique raster value):
+      1. Transfer raster to device (once, shared across all values)
+      2. classify_cells kernel -- binary-classify each 2x2 cell for target value
       3. Compact non-trivial cells via CuPy boolean indexing
-      4. edge_count kernel + exclusive prefix sum — compute write offsets
-      5. emit_edges kernel — emit directed edge segments with affine transform
-      6. Transfer edges to host for ring assembly (graph traversal)
-      7. Chain edges into rings, convert to Shapely geometries
+      4. edge_count kernel + prefix sum -- compute write offsets
+      5. emit_edges kernel -- emit directed edges with precomputed affine offsets
+      6. Accumulate edges across all unique values
+      7. Single bulk D2H transfer of concatenated edge arrays
+      8. Chain edges into rings, convert to Shapely geometries (host)
+
+    Multi-value correctness: marching-squares classifies cells as in/out
+    relative to a single target value.  To produce complete closed rings for
+    every distinct raster value, we iterate over each unique non-nodata value
+    and run the classify/compact/count/emit pipeline once per value.
+
+    Optimizations (o18.3.22):
+      - Occupancy-based launch config (no hardcoded block sizes)
+      - Precomputed affine half-step offsets eliminate per-thread recomputation
+      - Grid-stride loops with ILP=4 on all kernels
+      - __constant__ edge lookup tables in emit_edges and edge_count kernels
+      - Reused device buffers (d_cell_class, d_cell_indices) across value iters
+      - No intermediate syncs between same-stream kernel launches
+      - Single bulk D2H transfer of concatenated results at the end
 
     Returns (geometries, values) lists, same format as CPU path.
     """
@@ -352,41 +368,51 @@ def polygonize_gpu(
 
     t0 = time.perf_counter()
 
-    # --- Prepare raster data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        data = data[0]
+    # --- Prepare raster data on device (zero-copy: no D->H->D) ---
+    # Move raster to device using the standard residency pattern.
+    # Shape metadata is available without any transfer.
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="polygonize_gpu requires device-resident data",
+    )
+    d_data = raster.device_data()
+    if d_data.ndim == 3:
+        d_data = d_data[0]
 
-    orig_height, orig_width = data.shape
+    orig_height, orig_width = d_data.shape
 
     if orig_height < 2 or orig_width < 2:
         return [], []
 
-    # --- Pad the raster with a 1-pixel nodata border ---
+    # --- Pad the raster with a 1-pixel nodata border (all on device) ---
     # This is the standard marching-squares padding technique: by surrounding
     # the raster with a border of "outside" values, boundary cells at the
     # raster edge naturally become mixed cells and produce edges.  Without
     # padding, homogeneous regions touching the raster border generate only
     # class-15 (all-match) cells that emit zero edges, so rings can never
     # close and no polygons are produced.
-    data_f64 = data.astype(np.float64)
+    d_data_f64 = d_data.astype(cp.float64)
 
     # Choose a sentinel value for the padding border that is guaranteed to
-    # differ from every real data pixel.
+    # differ from every real data pixel.  The min/max are computed on device.
     if raster.nodata is not None and not np.isnan(raster.nodata):
         pad_value = float(raster.nodata)
     else:
-        # Use a value outside the data range (works even for NaN nodata)
-        finite_vals = data_f64[np.isfinite(data_f64)]
-        if finite_vals.size > 0:
-            pad_value = float(np.nanmin(finite_vals)) - 1.0
+        # Use a value outside the data range (works even for NaN nodata).
+        # Compute on device; single scalar D2H is unavoidable for the branch.
+        d_finite = d_data_f64[cp.isfinite(d_data_f64)]
+        if d_finite.size > 0:
+            pad_value = float(d_finite.min().item())  # single scalar D2H
+            pad_value -= 1.0
         else:
             pad_value = 0.0
 
-    padded = np.full((orig_height + 2, orig_width + 2), pad_value, dtype=np.float64)
-    padded[1:-1, 1:-1] = data_f64
+    # Pad on device: allocate padded buffer and copy interior via slice
+    d_padded = cp.full((orig_height + 2, orig_width + 2), pad_value, dtype=cp.float64)
+    d_padded[1:-1, 1:-1] = d_data_f64
 
-    height, width = padded.shape
+    height, width = d_padded.shape
     cell_width = width - 1
     cell_height = height - 1
     total_cells = cell_width * cell_height
@@ -394,27 +420,44 @@ def polygonize_gpu(
     if total_cells == 0:
         return [], []
 
-    # Transfer padded raster to device
-    d_raster = cp.asarray(np.ascontiguousarray(padded))
+    # d_padded is the device raster used by kernels (replaces old d_raster)
+    d_raster = d_padded
 
-    # Nodata mask for the padded raster: border pixels are always nodata,
-    # and interior pixels inherit the original nodata mask.
-    host_mask = np.ones((height, width), dtype=np.uint8)  # border = nodata
+    # Nodata mask for the padded raster (all on device):
+    # Border pixels are always nodata; interior pixels inherit the original mask.
+    d_nodata_mask = cp.ones((height, width), dtype=cp.uint8)  # border = nodata
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            host_mask[1:-1, 1:-1] = np.isnan(data).astype(np.uint8)
+            d_nodata_mask[1:-1, 1:-1] = cp.isnan(d_data).astype(cp.uint8)
         else:
-            host_mask[1:-1, 1:-1] = (data == raster.nodata).astype(np.uint8)
+            d_nodata_mask[1:-1, 1:-1] = (d_data == raster.nodata).astype(cp.uint8)
     else:
-        host_mask[1:-1, 1:-1] = 0  # no nodata in original data
-    d_nodata_mask = cp.asarray(host_mask)
+        d_nodata_mask[1:-1, 1:-1] = 0  # no nodata in original data
     nodata_mask_ptr = d_nodata_mask.data.ptr
 
-    # Allocate classification outputs
-    d_cell_class = cp.zeros(total_cells, dtype=cp.int32)
-    d_cell_value = cp.zeros(total_cells, dtype=cp.float64)
+    # --- Find unique non-nodata values on device ---
+    # Each unique value gets its own binary marching-squares pass so that
+    # every region produces a complete set of closed boundary rings.
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            d_valid = d_data_f64[~cp.isnan(d_data_f64)]
+        else:
+            d_valid = d_data_f64[d_data_f64 != raster.nodata]
+        d_unique = cp.unique(d_valid)
+    else:
+        d_unique = cp.unique(d_data_f64)
 
-    # --- Compile and launch classify_cells kernel ---
+    # Exclude the padding sentinel from unique values (it is never a real value)
+    d_unique = d_unique[d_unique != pad_value]
+
+    # Single bulk D2H for the (small) unique-values array -- needed to drive
+    # the per-value Python loop below.
+    unique_values = cp.asnumpy(d_unique)
+
+    if len(unique_values) == 0:
+        return [], []
+
+    # --- Compile kernels (once, reused across all value iterations) ---
     runtime = get_cuda_runtime()
 
     classify_key = make_kernel_cache_key("classify_cells", CLASSIFY_CELLS_KERNEL_SOURCE)
@@ -424,57 +467,6 @@ def polygonize_gpu(
         kernel_names=("classify_cells",),
     )
 
-    block_size = 256
-    grid_size = (total_cells + block_size - 1) // block_size
-
-    classify_params = (
-        (
-            d_raster.data.ptr,
-            nodata_mask_ptr,
-            d_cell_class.data.ptr,
-            d_cell_value.data.ptr,
-            width,
-            height,
-            cell_width,
-            cell_height,
-        ),
-        (
-            KERNEL_PARAM_PTR,  # raster
-            KERNEL_PARAM_PTR,  # nodata_mask
-            KERNEL_PARAM_PTR,  # cell_class
-            KERNEL_PARAM_PTR,  # cell_value
-            KERNEL_PARAM_I32,  # raster_width
-            KERNEL_PARAM_I32,  # raster_height
-            KERNEL_PARAM_I32,  # cell_width
-            KERNEL_PARAM_I32,  # cell_height
-        ),
-    )
-
-    runtime.launch(
-        kernel=classify_kernels["classify_cells"],
-        grid=(grid_size, 1, 1),
-        block=(block_size, 1, 1),
-        params=classify_params,
-    )
-
-    # --- Compact non-trivial cells (class != 0 and class != 15) ---
-    # Use CuPy boolean indexing (zero-copy on device)
-    nontrivial_mask = (d_cell_class != 0) & (d_cell_class != 15)
-    d_cell_indices = cp.arange(total_cells, dtype=cp.int32)
-
-    compact_idx = d_cell_indices[nontrivial_mask]
-    compact_class = d_cell_class[nontrivial_mask]
-    compact_value = d_cell_value[nontrivial_mask]
-
-    n_nontrivial = int(compact_idx.size)
-
-    if n_nontrivial == 0:
-        # With padding, this only happens when the entire raster is nodata.
-        return [], []
-
-    # --- Compute edge counts and prefix sum for write offsets ---
-    d_edge_counts = cp.zeros(n_nontrivial, dtype=cp.int32)
-
     edge_count_key = make_kernel_cache_key("edge_count", EDGE_COUNT_KERNEL_SOURCE)
     edge_count_kernels = runtime.compile_kernels(
         cache_key=edge_count_key,
@@ -482,47 +474,6 @@ def polygonize_gpu(
         kernel_names=("edge_count",),
     )
 
-    ec_grid = (n_nontrivial + block_size - 1) // block_size
-    ec_params = (
-        (
-            compact_class.data.ptr,
-            d_edge_counts.data.ptr,
-            n_nontrivial,
-        ),
-        (
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_I32,
-        ),
-    )
-    runtime.launch(
-        kernel=edge_count_kernels["edge_count"],
-        grid=(ec_grid, 1, 1),
-        block=(block_size, 1, 1),
-        params=ec_params,
-    )
-
-    # Exclusive prefix sum for write offsets (CuPy cumsum)
-    d_edge_offsets = cp.zeros(n_nontrivial, dtype=cp.int32)
-    if n_nontrivial > 0:
-        cumsum = cp.cumsum(d_edge_counts)
-        # exclusive sum: shift right by 1, first element = 0
-        d_edge_offsets[1:] = cumsum[:-1]
-        d_edge_offsets[0] = 0
-
-    total_edges = int(cp.sum(d_edge_counts).item())
-
-    if total_edges == 0:
-        return [], []
-
-    # --- Allocate edge output arrays ---
-    d_edge_x0 = cp.zeros(total_edges, dtype=cp.float64)
-    d_edge_y0 = cp.zeros(total_edges, dtype=cp.float64)
-    d_edge_x1 = cp.zeros(total_edges, dtype=cp.float64)
-    d_edge_y1 = cp.zeros(total_edges, dtype=cp.float64)
-    d_edge_value = cp.zeros(total_edges, dtype=cp.float64)
-
-    # --- Compile and launch emit_edges kernel ---
     emit_key = make_kernel_cache_key("emit_edges", EMIT_EDGES_KERNEL_SOURCE)
     emit_kernels = runtime.compile_kernels(
         cache_key=emit_key,
@@ -530,6 +481,12 @@ def polygonize_gpu(
         kernel_names=("emit_edges",),
     )
 
+    # Occupancy-based launch config for classify (total_cells items)
+    classify_grid, classify_block = runtime.launch_config(
+        classify_kernels["classify_cells"], total_cells
+    )
+
+    # Precompute affine transform parameters (shared across all value iters)
     a, b, c_aff, d_aff, e_aff, f_aff = raster.affine
 
     # Adjust the affine translation to account for the 1-pixel padding.
@@ -543,61 +500,195 @@ def polygonize_gpu(
     c_pad = c_aff - a - b
     f_pad = f_aff - d_aff - e_aff
 
-    emit_grid = (n_nontrivial + block_size - 1) // block_size
-    emit_params = (
-        (
-            compact_idx.data.ptr,
-            compact_class.data.ptr,
-            compact_value.data.ptr,
-            d_edge_offsets.data.ptr,
-            d_edge_x0.data.ptr,
-            d_edge_y0.data.ptr,
-            d_edge_x1.data.ptr,
-            d_edge_y1.data.ptr,
-            d_edge_value.data.ptr,
-            cell_width,
-            n_nontrivial,
-            a,
-            b,
-            c_pad,
-            d_aff,
-            e_aff,
-            f_pad,
-        ),
-        (
-            KERNEL_PARAM_PTR,  # compact_cell_idx
-            KERNEL_PARAM_PTR,  # compact_cell_class
-            KERNEL_PARAM_PTR,  # compact_cell_value
-            KERNEL_PARAM_PTR,  # edge_offsets
-            KERNEL_PARAM_PTR,  # edge_x0
-            KERNEL_PARAM_PTR,  # edge_y0
-            KERNEL_PARAM_PTR,  # edge_x1
-            KERNEL_PARAM_PTR,  # edge_y1
-            KERNEL_PARAM_PTR,  # edge_value
-            KERNEL_PARAM_I32,  # cell_width
-            KERNEL_PARAM_I32,  # n_cells
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,  # aff a, b, c
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,  # aff d, e, f
-        ),
-    )
+    # Precompute affine half-step offsets on the host (4 scalar doubles).
+    half_dx_x = 0.5 * a  # x-shift for half column step
+    half_dx_y = 0.5 * d_aff  # y-shift for half column step
+    half_dy_x = 0.5 * b  # x-shift for half row step
+    half_dy_y = 0.5 * e_aff  # y-shift for half row step
 
-    runtime.launch(
-        kernel=emit_kernels["emit_edges"],
-        grid=(emit_grid, 1, 1),
-        block=(block_size, 1, 1),
-        params=emit_params,
-    )
+    # Pre-allocate reusable device buffers for classification
+    d_cell_class = cp.zeros(total_cells, dtype=cp.int32)
+    d_cell_indices = cp.arange(total_cells, dtype=cp.int32)
 
-    # --- Transfer edges to host for ring assembly ---
-    h_edge_x0 = cp.asnumpy(d_edge_x0)
-    h_edge_y0 = cp.asnumpy(d_edge_y0)
-    h_edge_x1 = cp.asnumpy(d_edge_x1)
-    h_edge_y1 = cp.asnumpy(d_edge_y1)
-    h_edge_value = cp.asnumpy(d_edge_value)
+    # Accumulate edge arrays across all unique-value passes
+    all_edge_x0 = []
+    all_edge_y0 = []
+    all_edge_x1 = []
+    all_edge_y1 = []
+    all_edge_value = []
+    total_nontrivial = 0
+    grand_total_edges = 0
+
+    # --- Per-value marching-squares pass ---
+    for target_val in unique_values:
+        target_val_f64 = float(target_val)
+
+        # 1. Binary classify cells for this target value
+        classify_params = (
+            (
+                d_raster.data.ptr,
+                nodata_mask_ptr,
+                d_cell_class.data.ptr,
+                width,
+                cell_width,
+                cell_height,
+                target_val_f64,
+            ),
+            (
+                KERNEL_PARAM_PTR,  # raster
+                KERNEL_PARAM_PTR,  # nodata_mask
+                KERNEL_PARAM_PTR,  # cell_class
+                KERNEL_PARAM_I32,  # raster_width
+                KERNEL_PARAM_I32,  # cell_width
+                KERNEL_PARAM_I32,  # cell_height
+                KERNEL_PARAM_F64,  # target_value
+            ),
+        )
+
+        runtime.launch(
+            kernel=classify_kernels["classify_cells"],
+            grid=classify_grid,
+            block=classify_block,
+            params=classify_params,
+        )
+
+        # 2. Compact non-trivial cells (class != 0 and class != 15)
+        nontrivial_mask = (d_cell_class != 0) & (d_cell_class != 15)
+        compact_idx = d_cell_indices[nontrivial_mask]
+        compact_class = d_cell_class[nontrivial_mask]
+        n_nontrivial = compact_idx.shape[0]
+
+        if n_nontrivial == 0:
+            continue
+
+        total_nontrivial += n_nontrivial
+
+        # 3. Compute edge counts and prefix sum for write offsets
+        d_edge_counts = cp.zeros(n_nontrivial, dtype=cp.int32)
+
+        ec_grid, ec_block = runtime.launch_config(edge_count_kernels["edge_count"], n_nontrivial)
+        ec_params = (
+            (
+                compact_class.data.ptr,
+                d_edge_counts.data.ptr,
+                n_nontrivial,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        runtime.launch(
+            kernel=edge_count_kernels["edge_count"],
+            grid=ec_grid,
+            block=ec_block,
+            params=ec_params,
+        )
+
+        # Prefix sum for write offsets (CuPy cumsum + shift)
+        d_edge_offsets = cp.empty(n_nontrivial, dtype=cp.int32)
+        d_edge_offsets[0] = 0
+        if n_nontrivial > 1:
+            cp.cumsum(d_edge_counts[:-1], out=d_edge_offsets[1:])
+
+        total_edges = int(cp.sum(d_edge_counts).item())
+
+        if total_edges == 0:
+            continue
+
+        grand_total_edges += total_edges
+
+        # 4. Allocate and emit edges for this value
+        d_edge_x0 = cp.empty(total_edges, dtype=cp.float64)
+        d_edge_y0 = cp.empty(total_edges, dtype=cp.float64)
+        d_edge_x1 = cp.empty(total_edges, dtype=cp.float64)
+        d_edge_y1 = cp.empty(total_edges, dtype=cp.float64)
+        d_edge_value = cp.empty(total_edges, dtype=cp.float64)
+
+        emit_grid, emit_block = runtime.launch_config(emit_kernels["emit_edges"], n_nontrivial)
+        emit_params = (
+            (
+                compact_idx.data.ptr,
+                compact_class.data.ptr,
+                d_edge_offsets.data.ptr,
+                d_edge_x0.data.ptr,
+                d_edge_y0.data.ptr,
+                d_edge_x1.data.ptr,
+                d_edge_y1.data.ptr,
+                d_edge_value.data.ptr,
+                cell_width,
+                n_nontrivial,
+                target_val_f64,
+                a,
+                b,
+                c_pad,
+                d_aff,
+                e_aff,
+                f_pad,
+                half_dx_x,
+                half_dx_y,
+                half_dy_x,
+                half_dy_y,
+            ),
+            (
+                KERNEL_PARAM_PTR,  # compact_cell_idx
+                KERNEL_PARAM_PTR,  # compact_cell_class
+                KERNEL_PARAM_PTR,  # edge_offsets
+                KERNEL_PARAM_PTR,  # edge_x0
+                KERNEL_PARAM_PTR,  # edge_y0
+                KERNEL_PARAM_PTR,  # edge_x1
+                KERNEL_PARAM_PTR,  # edge_y1
+                KERNEL_PARAM_PTR,  # edge_value
+                KERNEL_PARAM_I32,  # cell_width
+                KERNEL_PARAM_I32,  # n_cells
+                KERNEL_PARAM_F64,  # target_value
+                KERNEL_PARAM_F64,  # aff_a
+                KERNEL_PARAM_F64,  # aff_b
+                KERNEL_PARAM_F64,  # aff_c (pad-adjusted)
+                KERNEL_PARAM_F64,  # aff_d
+                KERNEL_PARAM_F64,  # aff_e
+                KERNEL_PARAM_F64,  # aff_f (pad-adjusted)
+                KERNEL_PARAM_F64,  # half_dx_x
+                KERNEL_PARAM_F64,  # half_dx_y
+                KERNEL_PARAM_F64,  # half_dy_x
+                KERNEL_PARAM_F64,  # half_dy_y
+            ),
+        )
+
+        runtime.launch(
+            kernel=emit_kernels["emit_edges"],
+            grid=emit_grid,
+            block=emit_block,
+            params=emit_params,
+        )
+
+        # Accumulate on-device arrays (concatenated after the loop)
+        all_edge_x0.append(d_edge_x0)
+        all_edge_y0.append(d_edge_y0)
+        all_edge_x1.append(d_edge_x1)
+        all_edge_y1.append(d_edge_y1)
+        all_edge_value.append(d_edge_value)
+
+    if grand_total_edges == 0:
+        return [], []
+
+    # --- Concatenate all edge arrays and transfer to host ---
+    # Single bulk D2H transfer point; all prior GPU work completes
+    # implicitly via cp.asnumpy's internal synchronization.
+    if len(all_edge_x0) == 1:
+        # Fast path: single value, no concatenation needed
+        h_edge_x0 = cp.asnumpy(all_edge_x0[0])
+        h_edge_y0 = cp.asnumpy(all_edge_y0[0])
+        h_edge_x1 = cp.asnumpy(all_edge_x1[0])
+        h_edge_y1 = cp.asnumpy(all_edge_y1[0])
+        h_edge_value = cp.asnumpy(all_edge_value[0])
+    else:
+        h_edge_x0 = cp.asnumpy(cp.concatenate(all_edge_x0))
+        h_edge_y0 = cp.asnumpy(cp.concatenate(all_edge_y0))
+        h_edge_x1 = cp.asnumpy(cp.concatenate(all_edge_x1))
+        h_edge_y1 = cp.asnumpy(cp.concatenate(all_edge_y1))
+        h_edge_value = cp.asnumpy(cp.concatenate(all_edge_value))
 
     # --- Chain edges into rings and build polygons ---
     value_rings = _chain_edges_to_rings(
@@ -617,7 +708,8 @@ def polygonize_gpu(
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(
                 f"gpu_polygonize classify_cells={total_cells} "
-                f"nontrivial={n_nontrivial} edges={total_edges} "
+                f"unique_values={len(unique_values)} "
+                f"nontrivial={total_nontrivial} edges={grand_total_edges} "
                 f"polygons={len(geometries)} elapsed={elapsed:.3f}s"
             ),
             residency=raster.residency,

@@ -144,6 +144,7 @@ class TestZonalStatsDispatch:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestZonalStatsGPU:
     """GPU path: verify CCCL-based zonal stats match CPU for all 7 stat types."""
@@ -227,6 +228,7 @@ class TestZonalStatsGPU:
         assert z1["median"] == pytest.approx(2.5)
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestZonalStatsGPUNodata:
     """GPU path: nodata handling."""
@@ -274,6 +276,7 @@ class TestZonalStatsGPUNodata:
         assert z2["sum"] == pytest.approx(40.0)
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestZonalStatsGPUEdgeCases:
     """GPU path: edge cases."""

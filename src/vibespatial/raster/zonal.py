@@ -55,7 +55,7 @@ def _should_use_gpu(zones: OwnedRasterArray, values: OwnedRasterArray) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# NVRTC kernel sources for median and std deviation
+# NVRTC kernel sources for median extraction
 # ---------------------------------------------------------------------------
 
 _MEDIAN_KERNEL_SOURCE = r"""
@@ -67,50 +67,23 @@ void extract_median(
     double* __restrict__ out,
     const int num_segments
 ) {
-    int seg = blockIdx.x * blockDim.x + threadIdx.x;
-    if (seg >= num_segments) return;
+    const int stride = blockDim.x * gridDim.x;
+    for (int seg = blockIdx.x * blockDim.x + threadIdx.x;
+         seg < num_segments;
+         seg += stride) {
+        const int s = starts[seg];
+        const int e = ends[seg];
+        const int count = e - s;
 
-    int s = starts[seg];
-    int e = ends[seg];
-    int count = e - s;
-
-    if (count == 0) {
-        out[seg] = 0.0 / 0.0;  // NaN
-        return;
+        if (count == 0) {
+            out[seg] = 0.0 / 0.0;  // NaN
+        } else if (count & 1) {
+            out[seg] = sorted_values[s + (count >> 1)];
+        } else {
+            const int mid = count >> 1;
+            out[seg] = (sorted_values[s + mid - 1] + sorted_values[s + mid]) * 0.5;
+        }
     }
-
-    if (count % 2 == 1) {
-        out[seg] = sorted_values[s + count / 2];
-    } else {
-        int mid = count / 2;
-        out[seg] = (sorted_values[s + mid - 1] + sorted_values[s + mid]) * 0.5;
-    }
-}
-"""
-
-_SUM_OF_SQUARES_KERNEL_SOURCE = r"""
-extern "C" __global__
-void compute_sum_of_squares(
-    const double* __restrict__ values,
-    const double* __restrict__ means,
-    const int* __restrict__ starts,
-    const int* __restrict__ ends,
-    double* __restrict__ out,
-    const int num_segments
-) {
-    int seg = blockIdx.x * blockDim.x + threadIdx.x;
-    if (seg >= num_segments) return;
-
-    int s = starts[seg];
-    int e = ends[seg];
-    double mean_val = means[seg];
-    double sum_sq = 0.0;
-
-    for (int i = s; i < e; i++) {
-        double diff = values[i] - mean_val;
-        sum_sq += diff * diff;
-    }
-    out[seg] = sum_sq;
 }
 """
 
@@ -249,7 +222,8 @@ def _zonal_stats_gpu(
     d_zones_flat = d_zones.ravel().astype(cp.int64)
     d_values_flat = d_values.ravel().astype(cp.float64)
 
-    total_pixels = int(d_zones_flat.size)
+    # Use .shape[0] instead of int(.size) to avoid implicit D2H sync
+    total_pixels = d_zones_flat.shape[0]
 
     # ---- Step (b): Build valid mask on device ----
     d_valid = cp.ones(total_pixels, dtype=cp.bool_)
@@ -270,7 +244,8 @@ def _zonal_stats_gpu(
 
     # ---- Step (c): Compact valid pixels ----
     d_valid_indices = cp.flatnonzero(d_valid)
-    n_valid = int(d_valid_indices.size)
+    # Use .shape[0] instead of int(.size) to avoid implicit D2H sync
+    n_valid = d_valid_indices.shape[0]
 
     if n_valid == 0:
         return pd.DataFrame({"zone": pd.array([], dtype="int64")})
@@ -361,47 +336,43 @@ def _zonal_stats_gpu(
 
         elif stat is ZonalStatistic.STD:
             # STD = sqrt(sum((x - mean)^2) / count)
-            # Use a custom NVRTC kernel to compute sum-of-squares per segment
-            runtime = get_cuda_runtime()
-            cache_key = make_kernel_cache_key(
-                "compute_sum_of_squares", _SUM_OF_SQUARES_KERNEL_SOURCE
-            )
-            kernels = runtime.compile_kernels(
-                cache_key=cache_key,
-                source=_SUM_OF_SQUARES_KERNEL_SOURCE,
-                kernel_names=("compute_sum_of_squares",),
+            #
+            # Welford-style two-pass:
+            #   pass 1: CCCL segmented_reduce_sum for sum -> mean (done above)
+            #   pass 2: CCCL segmented_reduce_sum for sum((x - mean)^2)
+            #
+            # We compute (x - mean)^2 as a CuPy vectorised op over the
+            # sorted values array, using per-segment broadcast of means
+            # via fancy-index from d_starts/d_ends offsets.  This avoids
+            # the O(n)-per-segment serial loop in the old NVRTC kernel.
+            #
+            # Build per-pixel means via segment broadcast (all on-device):
+            # 1. Create a segment-id array via searchsorted of pixel
+            #    indices into d_starts.
+            # 2. Gather means[seg_id] to get per-pixel mean.
+            # 3. Compute (value - mean)^2 element-wise.
+            # 4. CCCL segmented_reduce_sum over the squared diffs.
+
+            # Map each pixel position to its segment id
+            d_pixel_idx = cp.arange(n_valid, dtype=cp.int32)
+            # searchsorted(starts, pixel_idx, side='right') - 1 gives
+            # the segment each pixel belongs to
+            d_seg_ids = cp.searchsorted(d_starts, d_pixel_idx, side="right").astype(cp.int32) - 1
+            # Broadcast means to per-pixel
+            d_pixel_means = d_means[d_seg_ids]
+            # Squared differences
+            d_sq_diffs = (d_sorted_values - d_pixel_means) ** 2
+
+            # Sum of squared diffs per segment via CCCL
+            sq_result = segmented_reduce_sum(
+                d_sq_diffs,
+                d_starts,
+                d_ends,
+                num_segments=n_zones,
+                synchronize=False,
             )
 
-            d_sum_sq = cp.empty(n_zones, dtype=cp.float64)
-            block_size = 256
-            grid_size = max(1, (n_zones + block_size - 1) // block_size)
-
-            params = (
-                (
-                    d_sorted_values.data.ptr,
-                    d_means.data.ptr,
-                    d_starts.data.ptr,
-                    d_ends.data.ptr,
-                    d_sum_sq.data.ptr,
-                    n_zones,
-                ),
-                (
-                    KERNEL_PARAM_PTR,  # values
-                    KERNEL_PARAM_PTR,  # means
-                    KERNEL_PARAM_PTR,  # starts
-                    KERNEL_PARAM_PTR,  # ends
-                    KERNEL_PARAM_PTR,  # out
-                    KERNEL_PARAM_I32,  # num_segments
-                ),
-            )
-            runtime.launch(
-                kernel=kernels["compute_sum_of_squares"],
-                grid=(grid_size, 1, 1),
-                block=(block_size, 1, 1),
-                params=params,
-            )
-
-            d_std = cp.sqrt(d_sum_sq / d_counts)
+            d_std = cp.sqrt(sq_result.values / d_counts)
             results_device["std"] = d_std
 
         elif stat is ZonalStatistic.MEDIAN:
@@ -417,8 +388,8 @@ def _zonal_stats_gpu(
             )
             d_seg_sorted_values = seg_sort_result.keys
 
-            # Extract median via NVRTC kernel that indexes the middle
-            # element(s) of the now-sorted segments.
+            # Extract median via NVRTC kernel with grid-stride loop
+            # and occupancy-based launch config.
             runtime = get_cuda_runtime()
             cache_key = make_kernel_cache_key("extract_median", _MEDIAN_KERNEL_SOURCE)
             kernels = runtime.compile_kernels(
@@ -428,8 +399,9 @@ def _zonal_stats_gpu(
             )
 
             d_median = cp.empty(n_zones, dtype=cp.float64)
-            block_size = 256
-            grid_size = max(1, (n_zones + block_size - 1) // block_size)
+
+            # Occupancy-based launch config
+            grid, block = runtime.launch_config(kernels["extract_median"], n_zones)
 
             params = (
                 (
@@ -449,13 +421,14 @@ def _zonal_stats_gpu(
             )
             runtime.launch(
                 kernel=kernels["extract_median"],
-                grid=(grid_size, 1, 1),
-                block=(block_size, 1, 1),
+                grid=grid,
+                block=block,
                 params=params,
             )
             results_device["median"] = d_median
 
     # ---- Step (g): Transfer results to host, build DataFrame ----
+    # Single sync before all D2H transfers
     cp.cuda.Stream.null.synchronize()
 
     host_results: dict[str, object] = {

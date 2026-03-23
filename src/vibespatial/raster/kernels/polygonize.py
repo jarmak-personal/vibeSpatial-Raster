@@ -1,7 +1,8 @@
 """NVRTC kernel sources for marching-squares GPU polygonize.
 
 Kernels:
-  classify_cells — classify each 2x2 cell into one of 16 marching-squares cases
+  classify_cells — binary-classify each 2x2 cell for a given target value
+  edge_count     — count edges per non-trivial cell (for prefix-sum offsets)
   emit_edges     — emit directed edge segments for non-trivial cells
 
 The 16 cell classification indices encode which of the 4 corners (TL, TR, BR, BL)
@@ -11,14 +12,28 @@ Non-trivial cells (1..14) produce 1 or 2 boundary edge segments.
 Edge segments are directed so that the *interior* (matching region) is always
 on the RIGHT side of the edge.  This winding convention allows the host-side
 ring chainer to assemble correctly-oriented polygon rings.
+
+Multi-value support: the dispatch code iterates over each unique raster value,
+running classify_cells once per value with that value as the target.  This
+produces a complete closed ring for every distinct region, regardless of how
+many different values adjoin a given cell.
+
+Optimizations (o18.3.22):
+  - Grid-stride loops with ILP=4 on all kernels
+  - const __restrict__ on all read-only pointer parameters
+  - __constant__ edge lookup tables (emit_edges, edge_count)
+  - Precomputed affine transform scalars passed as kernel params
+  - Branchless nodata classification via bitwise ops
+  - Float literal precision qualifiers (not applicable: raster data is f64)
 """
 
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# classify_cells kernel
+# classify_cells kernel (binary, per-target-value)
 # ---------------------------------------------------------------------------
-# One thread per 2x2 cell.  Cell (cx, cy) covers raster pixels:
+# Grid-stride loop with ILP=4.  One logical work item per 2x2 cell.
+# Cell (cx, cy) covers raster pixels:
 #   TL = (cy, cx)      TR = (cy, cx+1)
 #   BL = (cy+1, cx)    BR = (cy+1, cx+1)
 #
@@ -26,85 +41,83 @@ from __future__ import annotations
 # cell_height = raster_height - 1
 # total_cells = cell_width * cell_height
 #
+# Parameters:
+#   target_value — the raster value to treat as "inside" for this pass
+#
 # Outputs:
 #   d_cell_class[cell_idx]  — 4-bit classification (0..15)
-#   d_cell_value[cell_idx]  — raster value of the TL corner (used for grouping)
 #
 # The classification bit-pattern is:
-#   bit 3 (8)  = TL matches
-#   bit 2 (4)  = TR matches
-#   bit 1 (2)  = BR matches
-#   bit 0 (1)  = BL matches
+#   bit 3 (8)  = TL matches target
+#   bit 2 (4)  = TR matches target
+#   bit 1 (2)  = BR matches target
+#   bit 0 (1)  = BL matches target
 #
-# "Matches" means the pixel value equals the TL corner value AND is not nodata.
+# "Matches" means the pixel value equals target_value AND is not nodata.
 
 CLASSIFY_CELLS_KERNEL_SOURCE = r"""
 extern "C" __global__ void classify_cells(
     const double* __restrict__ raster,
-    const unsigned char* __restrict__ nodata_mask,  // 1=nodata, nullable
+    const unsigned char* __restrict__ nodata_mask,
     int* __restrict__ cell_class,
-    double* __restrict__ cell_value,
-    int raster_width,
-    int raster_height,
-    int cell_width,
-    int cell_height
+    const int raster_width,
+    const int cell_width,
+    const int cell_height,
+    const double target_value
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_cells = cell_width * cell_height;
-    if (idx >= total_cells) return;
+    const int total_cells = cell_width * cell_height;
+    const int stride = blockDim.x * gridDim.x;
+    const int ILP = 4;
 
-    int cy = idx / cell_width;
-    int cx = idx % cell_width;
+    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+         base < total_cells;
+         base += stride * ILP) {
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            const int idx = base + j * stride;
+            if (idx >= total_cells) break;
 
-    // Pixel indices for the 4 corners
-    int tl = cy * raster_width + cx;
-    int tr = cy * raster_width + (cx + 1);
-    int bl = (cy + 1) * raster_width + cx;
-    int br = (cy + 1) * raster_width + (cx + 1);
+            const int cy = idx / cell_width;
+            const int cx = idx - cy * cell_width;
 
-    double v_tl = raster[tl];
-    double v_tr = raster[tr];
-    double v_bl = raster[bl];
-    double v_br = raster[br];
+            // Pixel indices for the 4 corners
+            const int row0 = cy * raster_width;
+            const int row1 = row0 + raster_width;
+            const int tl = row0 + cx;
+            const int tr = row0 + cx + 1;
+            const int bl = row1 + cx;
+            const int br = row1 + cx + 1;
 
-    // Check nodata
-    int nd_tl = (nodata_mask != nullptr) ? nodata_mask[tl] : 0;
-    int nd_tr = (nodata_mask != nullptr) ? nodata_mask[tr] : 0;
-    int nd_bl = (nodata_mask != nullptr) ? nodata_mask[bl] : 0;
-    int nd_br = (nodata_mask != nullptr) ? nodata_mask[br] : 0;
+            const double v_tl = raster[tl];
+            const double v_tr = raster[tr];
+            const double v_bl = raster[bl];
+            const double v_br = raster[br];
 
-    // If ALL corners are nodata, this cell is trivial (class 0, no edges)
-    if (nd_tl && nd_tr && nd_bl && nd_br) {
-        cell_class[idx] = 0;
-        cell_value[idx] = 0.0;
-        return;
+            // Nodata flags: branchless load (0 when mask is null)
+            const int has_mask = (nodata_mask != nullptr);
+            const int nd_tl = has_mask ? (int)nodata_mask[tl] : 0;
+            const int nd_tr = has_mask ? (int)nodata_mask[tr] : 0;
+            const int nd_bl = has_mask ? (int)nodata_mask[bl] : 0;
+            const int nd_br = has_mask ? (int)nodata_mask[br] : 0;
+
+            // Binary classification: corner matches iff value == target AND not nodata
+            const int match_tl = (!nd_tl) & (v_tl == target_value);
+            const int match_tr = (!nd_tr) & (v_tr == target_value);
+            const int match_br = (!nd_br) & (v_br == target_value);
+            const int match_bl = (!nd_bl) & (v_bl == target_value);
+
+            const int cls = (match_tl << 3) | (match_tr << 2) | (match_br << 1) | match_bl;
+
+            cell_class[idx] = cls;
+        }
     }
-
-    // Reference value is the first non-nodata corner (priority: TL, TR, BL, BR)
-    double ref;
-    if      (!nd_tl) ref = v_tl;
-    else if (!nd_tr) ref = v_tr;
-    else if (!nd_bl) ref = v_bl;
-    else             ref = v_br;
-
-    // Classify corners: does each corner match the reference value?
-    // Nodata corners do NOT match.
-    int match_tl = (!nd_tl && v_tl == ref) ? 1 : 0;
-    int match_tr = (!nd_tr && v_tr == ref) ? 1 : 0;
-    int match_br = (!nd_br && v_br == ref) ? 1 : 0;
-    int match_bl = (!nd_bl && v_bl == ref) ? 1 : 0;
-
-    int cls = (match_tl << 3) | (match_tr << 2) | (match_br << 1) | match_bl;
-
-    cell_class[idx] = cls;
-    cell_value[idx] = ref;
 }
 """
 
 # ---------------------------------------------------------------------------
 # emit_edges kernel
 # ---------------------------------------------------------------------------
-# One thread per non-trivial cell (class != 0 and class != 15).
+# Grid-stride loop with ILP=4.  One logical work item per non-trivial cell.
 #
 # Each non-trivial cell emits 1 or 2 directed edge segments.
 # Edges connect midpoints of the 4 cell sides:
@@ -113,13 +126,8 @@ extern "C" __global__ void classify_cells(
 #   Bottom midpoint = (cx + 0.5, cy + 1)
 #   Left midpoint   = (cx,       cy + 0.5)
 #
-# These are in pixel coordinates; the affine transform converts to world coords
-# inside the kernel.
-#
-# The edge table encodes, for each of the 16 classes, up to 2 edges.
-# Each edge is (start_side, end_side) where sides are:
-#   0 = Top, 1 = Right, 2 = Bottom, 3 = Left
-# -1 means "no edge".
+# Midpoints are converted to world coordinates using precomputed affine
+# half-step offsets passed as kernel params (avoids per-thread recomputation).
 #
 # Winding: interior (matching region) on the RIGHT of the directed edge.
 #
@@ -127,130 +135,126 @@ extern "C" __global__ void classify_cells(
 #   d_edge_x0, d_edge_y0 — start vertex world coords
 #   d_edge_x1, d_edge_y1 — end vertex world coords
 #   d_edge_value          — raster value for this edge (for grouping)
-#   d_edge_count_per_cell — number of edges emitted by each cell (1 or 2)
+#
+# The edge lookup tables are declared __constant__ to reduce register
+# pressure and exploit the constant cache (broadcast to all threads in a
+# warp accessing the same index).
 
 EMIT_EDGES_KERNEL_SOURCE = r"""
+// Constant-memory lookup tables shared by all threads.
+// n_edges_table: number of edges emitted per marching-squares class.
+__constant__ int c_n_edges[16] = {
+    0, 1, 1, 1, 1, 2, 1, 1,
+    1, 1, 2, 1, 1, 1, 1, 0
+};
+
+// Edge 0: start and end sides per class.  Side encoding: 0=T, 1=R, 2=B, 3=L.
+__constant__ int c_e0_start[16] = {
+    -1,  3,  2,  3,  1,  1,  2,  3,
+     0,  0,  0,  0,  1,  1,  2, -1
+};
+__constant__ int c_e0_end[16] = {
+    -1,  2,  1,  1,  0,  2,  0,  0,
+     3,  2,  1,  1,  3,  2,  3, -1
+};
+
+// Edge 1: only populated for saddle cases 5 and 10.
+__constant__ int c_e1_start[16] = {
+    -1, -1, -1, -1, -1,  3, -1, -1,
+    -1, -1,  2, -1, -1, -1, -1, -1
+};
+__constant__ int c_e1_end[16] = {
+    -1, -1, -1, -1, -1,  0, -1, -1,
+    -1, -1,  3, -1, -1, -1, -1, -1
+};
+
 extern "C" __global__ void emit_edges(
-    const int* __restrict__ compact_cell_idx,    // original cell indices (compacted)
-    const int* __restrict__ compact_cell_class,  // classification for each compacted cell
-    const double* __restrict__ compact_cell_value,
-    const int* __restrict__ edge_offsets,         // prefix sum: where each cell writes
+    const int* __restrict__ compact_cell_idx,
+    const int* __restrict__ compact_cell_class,
+    const int* __restrict__ edge_offsets,
     double* __restrict__ edge_x0,
     double* __restrict__ edge_y0,
     double* __restrict__ edge_x1,
     double* __restrict__ edge_y1,
     double* __restrict__ edge_value,
-    int cell_width,
-    int n_cells,        // number of non-trivial cells
-    double aff_a, double aff_b, double aff_c,
-    double aff_d, double aff_e, double aff_f
+    const int cell_width,
+    const int n_cells,
+    const double target_value,
+    const double aff_a, const double aff_b, const double aff_c,
+    const double aff_d, const double aff_e, const double aff_f,
+    const double half_dx_x, const double half_dx_y,
+    const double half_dy_x, const double half_dy_y
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_cells) return;
+    // Precomputed half-step offsets (passed as kernel params):
+    //   half_dx_x = 0.5 * aff_a   (x-shift for half-step in column direction)
+    //   half_dx_y = 0.5 * aff_d   (y-shift for half-step in column direction)
+    //   half_dy_x = 0.5 * aff_b   (x-shift for half-step in row direction)
+    //   half_dy_y = 0.5 * aff_e   (y-shift for half-step in row direction)
 
-    int orig_idx = compact_cell_idx[tid];
-    int cls = compact_cell_class[tid];
-    double val = compact_cell_value[tid];
+    const int stride = blockDim.x * gridDim.x;
+    const int ILP = 4;
 
-    int cy = orig_idx / cell_width;
-    int cx = orig_idx % cell_width;
+    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+         base < n_cells;
+         base += stride * ILP) {
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            const int tid = base + j * stride;
+            if (tid >= n_cells) break;
 
-    // Midpoints in pixel coordinates (fractional)
-    // Top:    (cx + 0.5, cy)
-    // Right:  (cx + 1,   cy + 0.5)
-    // Bottom: (cx + 0.5, cy + 1)
-    // Left:   (cx,       cy + 0.5)
-    double mx[4], my[4];
-    mx[0] = cx + 0.5; my[0] = cy;        // Top
-    mx[1] = cx + 1.0; my[1] = cy + 0.5;  // Right
-    mx[2] = cx + 0.5; my[2] = cy + 1.0;  // Bottom
-    mx[3] = cx;        my[3] = cy + 0.5;  // Left
+            const int orig_idx = compact_cell_idx[tid];
+            const int cls = compact_cell_class[tid];
 
-    // Edge table: for each class (0-15), up to 2 edges.
-    // Each edge is encoded as (start_side, end_side).
-    // -1 means no edge.
-    // Winding: interior on RIGHT of directed edge.
-    //
-    // The 16 marching-squares cases with TL=bit3, TR=bit2, BR=bit1, BL=bit0:
-    //  0 (0000): no edges
-    //  1 (0001): BL only      -> Left to Bottom    (interior=BL, on right)
-    //  2 (0010): BR only      -> Bottom to Right
-    //  3 (0011): BL+BR        -> Left to Right
-    //  4 (0100): TR only      -> Right to Top
-    //  5 (0101): TR+BL saddle -> Right to Bottom, Left to Top  (ambiguous, choose one)
-    //  6 (0110): TR+BR        -> Bottom to Top
-    //  7 (0111): TR+BR+BL     -> Left to Top
-    //  8 (1000): TL only      -> Top to Left
-    //  9 (1001): TL+BL        -> Top to Bottom
-    // 10 (1010): TL+BR saddle -> Top to Right, Bottom to Left  (ambiguous, choose one)
-    // 11 (1011): TL+BL+BR     -> Top to Right
-    // 12 (1100): TL+TR        -> Right to Left
-    // 13 (1101): TL+TR+BL     -> Right to Bottom
-    // 14 (1110): TL+TR+BR     -> Bottom to Left
-    // 15 (1111): no edges
+            const int cy = orig_idx / cell_width;
+            const int cx = orig_idx - cy * cell_width;
 
-    // Edge table: [class][edge_idx] = (start_side, end_side) packed as start*4+end
-    // Using -1 for no-edge.
-    // Encoding: side 0=T, 1=R, 2=B, 3=L
-    // start_side * 4 + end_side, or -1
+            // World coordinates of cell origin (cx, cy)
+            const double ox = aff_a * cx + aff_b * cy + aff_c;
+            const double oy = aff_d * cx + aff_e * cy + aff_f;
 
-    // Lookup: number of edges per class
-    const int n_edges_table[16] = {
-        0, 1, 1, 1, 1, 2, 1, 1,
-        1, 1, 2, 1, 1, 1, 1, 0
-    };
+            // Four midpoints in world coordinates, computed from origin + offsets
+            // Top:    origin + half_dx  (midpoint of top edge)
+            // Right:  origin + full_dx + half_dy  (midpoint of right edge)
+            // Bottom: origin + half_dx + full_dy  (midpoint of bottom edge)
+            // Left:   origin + half_dy  (midpoint of left edge)
+            const double wx_top    = ox + half_dx_x;
+            const double wy_top    = oy + half_dx_y;
+            const double wx_right  = ox + aff_a + half_dy_x;
+            const double wy_right  = oy + aff_d + half_dy_y;
+            const double wx_bottom = ox + half_dx_x + aff_b;
+            const double wy_bottom = oy + half_dx_y + aff_e;
+            const double wx_left   = ox + half_dy_x;
+            const double wy_left   = oy + half_dy_y;
 
-    // Edge start sides and end sides for each class, up to 2 edges
-    // Edge 0:
-    const int e0_start[16] = {
-        -1,  3,  2,  3,  1,  1,  2,  3,
-         0,  0,  0,  0,  1,  1,  2, -1
-    };
-    const int e0_end[16] = {
-        -1,  2,  1,  1,  0,  2,  0,  0,
-         3,  2,  1,  1,  3,  2,  3, -1
-    };
-    // Edge 1 (only for saddle cases 5 and 10):
-    const int e1_start[16] = {
-        -1, -1, -1, -1, -1,  3, -1, -1,
-        -1, -1,  2, -1, -1, -1, -1, -1
-    };
-    const int e1_end[16] = {
-        -1, -1, -1, -1, -1,  0, -1, -1,
-        -1, -1,  3, -1, -1, -1, -1, -1
-    };
+            // Pack midpoints into arrays for table-driven lookup
+            const double mx[4] = {wx_top, wx_right, wx_bottom, wx_left};
+            const double my[4] = {wy_top, wy_right, wy_bottom, wy_left};
 
-    int n_edges = n_edges_table[cls];
-    int write_pos = edge_offsets[tid];
+            const int n_edges = c_n_edges[cls];
+            const int write_pos = edge_offsets[tid];
 
-    // Helper: convert pixel coords to world coords via affine
-    // world_x = aff_a * px + aff_b * py + aff_c
-    // world_y = aff_d * px + aff_e * py + aff_f
+            if (n_edges >= 1) {
+                const int s0 = c_e0_start[cls];
+                const int e0 = c_e0_end[cls];
 
-    if (n_edges >= 1) {
-        int s0 = e0_start[cls];
-        int e0 = e0_end[cls];
-        double px0 = mx[s0], py0 = my[s0];
-        double px1 = mx[e0], py1 = my[e0];
+                edge_x0[write_pos] = mx[s0];
+                edge_y0[write_pos] = my[s0];
+                edge_x1[write_pos] = mx[e0];
+                edge_y1[write_pos] = my[e0];
+                edge_value[write_pos] = target_value;
+            }
 
-        edge_x0[write_pos] = aff_a * px0 + aff_b * py0 + aff_c;
-        edge_y0[write_pos] = aff_d * px0 + aff_e * py0 + aff_f;
-        edge_x1[write_pos] = aff_a * px1 + aff_b * py1 + aff_c;
-        edge_y1[write_pos] = aff_d * px1 + aff_e * py1 + aff_f;
-        edge_value[write_pos] = val;
-    }
+            if (n_edges >= 2) {
+                const int s1 = c_e1_start[cls];
+                const int e1 = c_e1_end[cls];
 
-    if (n_edges >= 2) {
-        int s1 = e1_start[cls];
-        int e1_s = e1_end[cls];
-        double px0 = mx[s1], py0 = my[s1];
-        double px1 = mx[e1_s], py1 = my[e1_s];
-
-        edge_x0[write_pos + 1] = aff_a * px0 + aff_b * py0 + aff_c;
-        edge_y0[write_pos + 1] = aff_d * px0 + aff_e * py0 + aff_f;
-        edge_x1[write_pos + 1] = aff_a * px1 + aff_b * py1 + aff_c;
-        edge_y1[write_pos + 1] = aff_d * px1 + aff_e * py1 + aff_f;
-        edge_value[write_pos + 1] = val;
+                edge_x0[write_pos + 1] = mx[s1];
+                edge_y0[write_pos + 1] = my[s1];
+                edge_x1[write_pos + 1] = mx[e1];
+                edge_y1[write_pos + 1] = my[e1];
+                edge_value[write_pos + 1] = target_value;
+            }
+        }
     }
 }
 """
@@ -258,23 +262,33 @@ extern "C" __global__ void emit_edges(
 # ---------------------------------------------------------------------------
 # Edge count kernel (helper to get per-cell edge counts for prefix sum)
 # ---------------------------------------------------------------------------
+# Grid-stride loop with ILP=4.
+# Uses __constant__ lookup table shared with emit_edges.
 
 EDGE_COUNT_KERNEL_SOURCE = r"""
+__constant__ int c_edge_count[16] = {
+    0, 1, 1, 1, 1, 2, 1, 1,
+    1, 1, 2, 1, 1, 1, 1, 0
+};
+
 extern "C" __global__ void edge_count(
     const int* __restrict__ compact_cell_class,
     int* __restrict__ counts,
-    int n_cells
+    const int n_cells
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_cells) return;
+    const int stride = blockDim.x * gridDim.x;
+    const int ILP = 4;
 
-    int cls = compact_cell_class[tid];
+    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+         base < n_cells;
+         base += stride * ILP) {
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            const int tid = base + j * stride;
+            if (tid >= n_cells) break;
 
-    const int n_edges_table[16] = {
-        0, 1, 1, 1, 1, 2, 1, 1,
-        1, 1, 2, 1, 1, 1, 1, 0
-    };
-
-    counts[tid] = n_edges_table[cls];
+            counts[tid] = c_edge_count[compact_cell_class[tid]];
+        }
+    }
 }
 """

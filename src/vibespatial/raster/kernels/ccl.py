@@ -3,8 +3,10 @@
 Algorithm: iterative union-find with atomicMin merging and pointer jumping.
 1. init_labels: foreground pixels get label = flat_index, background = -1
 2. local_merge: 4/8-connected neighbor merge using atomicMin on root labels
-3. pointer_jump: path compression until convergence
-4. relabel: compact labels to sequential 1..N
+   - Path-compressing find_root with path-splitting
+   - Grid-stride loop for full GPU utilization
+3. pointer_jump: path compression until full convergence (run to fixpoint)
+4. relabel: compact labels via direct lookup table (no binary search)
 
 ADR-0040: CCCL Connected Component Labeling
 """
@@ -12,7 +14,7 @@ ADR-0040: CCCL Connected Component Labeling
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Phase 1: Initialize labels
+# Phase 1: Initialize labels (grid-stride loop)
 # ---------------------------------------------------------------------------
 
 INIT_LABELS_SOURCE = r"""
@@ -22,23 +24,49 @@ void init_labels(
     const unsigned char* __restrict__ foreground,
     const int n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    labels[idx] = foreground[idx] ? idx : -1;
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += stride) {
+        labels[idx] = foreground[idx] ? idx : -1;
+    }
 }
 """
 
 # ---------------------------------------------------------------------------
-# Phase 2: Local merge (4-connected)
+# Phase 2: Local merge (4-connected) -- path-splitting find_root
 # ---------------------------------------------------------------------------
 
 LOCAL_MERGE_4C_SOURCE = r"""
-__device__ inline int find_root(int* labels, int idx) {
+__device__ inline int find_root(int* __restrict__ labels, int idx) {
     int root = idx;
-    while (labels[root] != root) {
-        root = labels[root];
+    while (true) {
+        int parent = labels[root];
+        if (parent == root) break;
+        // Path splitting: make root point to grandparent
+        int grandparent = labels[parent];
+        // Use atomicCAS for safe path splitting (non-destructive)
+        atomicCAS(&labels[root], parent, grandparent);
+        root = parent;
     }
     return root;
+}
+
+__device__ inline void union_roots(int* __restrict__ labels, int a, int b) {
+    // Lock-free union: always make the larger root point to the smaller
+    while (a != b) {
+        if (a < b) {
+            // Try to make b point to a
+            int old = atomicCAS(&labels[b], b, a);
+            if (old == b) return;  // Success
+            // Someone else changed labels[b]; re-find
+            b = find_root(labels, b);
+            a = find_root(labels, a);
+        } else {
+            // Swap so a < b
+            int tmp = a; a = b; b = tmp;
+        }
+    }
 }
 
 extern "C" __global__
@@ -58,44 +86,61 @@ void local_merge_4c(
 
     int my_root = find_root(labels, idx);
 
-    // 4-connected neighbors: up, down, left, right
-    int dx[4] = {0, 0, -1, 1};
-    int dy[4] = {-1, 1, 0, 0};
-
-    for (int i = 0; i < 4; i++) {
-        int nc = col + dx[i];
-        int nr = row + dy[i];
-        if (nc < 0 || nc >= width || nr < 0 || nr >= height) continue;
-
-        int nidx = nr * width + nc;
-        if (!foreground[nidx]) continue;
-
-        int n_root = find_root(labels, nidx);
-        if (n_root == my_root) continue;
-
-        // Union: smaller root becomes parent of larger root
-        int lo = min(my_root, n_root);
-        int hi = max(my_root, n_root);
-        int old = atomicMin(&labels[hi], lo);
-        if (old != lo) {
-            *changed = 1;
-            my_root = lo;  // update for subsequent neighbors
+    // 4-connected neighbors: right and down only (avoids redundant work)
+    // Each edge is processed once instead of twice
+    if (col + 1 < width) {
+        int nidx = idx + 1;
+        if (foreground[nidx]) {
+            int n_root = find_root(labels, nidx);
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
+                *changed = 1;
+                my_root = find_root(labels, idx);
+            }
+        }
+    }
+    if (row + 1 < height) {
+        int nidx = idx + width;
+        if (foreground[nidx]) {
+            int n_root = find_root(labels, nidx);
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
+                *changed = 1;
+                my_root = find_root(labels, idx);
+            }
         }
     }
 }
 """
 
 # ---------------------------------------------------------------------------
-# Phase 2 (alt): Local merge (8-connected)
+# Phase 2 (alt): Local merge (8-connected) -- path-splitting find_root
 # ---------------------------------------------------------------------------
 
 LOCAL_MERGE_8C_SOURCE = r"""
-__device__ inline int find_root(int* labels, int idx) {
+__device__ inline int find_root(int* __restrict__ labels, int idx) {
     int root = idx;
-    while (labels[root] != root) {
-        root = labels[root];
+    while (true) {
+        int parent = labels[root];
+        if (parent == root) break;
+        int grandparent = labels[parent];
+        atomicCAS(&labels[root], parent, grandparent);
+        root = parent;
     }
     return root;
+}
+
+__device__ inline void union_roots(int* __restrict__ labels, int a, int b) {
+    while (a != b) {
+        if (a < b) {
+            int old = atomicCAS(&labels[b], b, a);
+            if (old == b) return;
+            b = find_root(labels, b);
+            a = find_root(labels, a);
+        } else {
+            int tmp = a; a = b; b = tmp;
+        }
+    }
 }
 
 extern "C" __global__
@@ -115,26 +160,54 @@ void local_merge_8c(
 
     int my_root = find_root(labels, idx);
 
-    // 8-connected neighbors
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            int nc = col + dx;
-            int nr = row + dy;
-            if (nc < 0 || nc >= width || nr < 0 || nr >= height) continue;
+    // 8-connected: only check right, bottom-left, bottom, bottom-right
+    // This processes each edge exactly once (asymmetric neighborhood)
 
-            int nidx = nr * width + nc;
-            if (!foreground[nidx]) continue;
-
+    // Right neighbor
+    if (col + 1 < width) {
+        int nidx = idx + 1;
+        if (foreground[nidx]) {
             int n_root = find_root(labels, nidx);
-            if (n_root == my_root) continue;
-
-            int lo = min(my_root, n_root);
-            int hi = max(my_root, n_root);
-            int old = atomicMin(&labels[hi], lo);
-            if (old != lo) {
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
                 *changed = 1;
-                my_root = lo;
+                my_root = find_root(labels, idx);
+            }
+        }
+    }
+    // Bottom-left neighbor
+    if (row + 1 < height && col > 0) {
+        int nidx = idx + width - 1;
+        if (foreground[nidx]) {
+            int n_root = find_root(labels, nidx);
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
+                *changed = 1;
+                my_root = find_root(labels, idx);
+            }
+        }
+    }
+    // Bottom neighbor
+    if (row + 1 < height) {
+        int nidx = idx + width;
+        if (foreground[nidx]) {
+            int n_root = find_root(labels, nidx);
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
+                *changed = 1;
+                my_root = find_root(labels, idx);
+            }
+        }
+    }
+    // Bottom-right neighbor
+    if (row + 1 < height && col + 1 < width) {
+        int nidx = idx + width + 1;
+        if (foreground[nidx]) {
+            int n_root = find_root(labels, nidx);
+            if (n_root != my_root) {
+                union_roots(labels, my_root, n_root);
+                *changed = 1;
+                my_root = find_root(labels, idx);
             }
         }
     }
@@ -142,7 +215,7 @@ void local_merge_8c(
 """
 
 # ---------------------------------------------------------------------------
-# Phase 3: Pointer jumping (path compression)
+# Phase 3: Pointer jumping (path compression) -- grid-stride with ILP
 # ---------------------------------------------------------------------------
 
 POINTER_JUMP_SOURCE = r"""
@@ -152,56 +225,54 @@ void pointer_jump(
     const int n,
     int* __restrict__ changed
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += stride) {
+        int label = labels[idx];
+        if (label < 0) continue;
 
-    int label = labels[idx];
-    if (label < 0) return;
-
-    int root = labels[label];
-    if (root != label) {
-        labels[idx] = root;
-        *changed = 1;
+        // Bounded path compression: chase toward root with hop limit.
+        // 64 hops is sufficient for all practical tree depths; for
+        // pathological inputs (long thin components), remaining depth
+        // is flattened in subsequent pointer_jump iterations.
+        int root = label;
+        for (int hop = 0; hop < 64; hop++) {
+            int parent = labels[root];
+            if (parent == root) break;
+            root = parent;
+        }
+        if (root != label) {
+            labels[idx] = root;
+            *changed = 1;
+        }
     }
 }
 """
 
 # ---------------------------------------------------------------------------
-# Phase 4: Relabel roots to compact sequential labels (1..N)
+# Phase 4: Relabel via direct lookup table (no binary search)
 # ---------------------------------------------------------------------------
 
 RELABEL_SOURCE = r"""
 extern "C" __global__
 void relabel(
     int* __restrict__ labels,
-    const int* __restrict__ root_to_compact,
-    const int* __restrict__ unique_roots,
-    const int num_roots,
+    const int* __restrict__ compact_lut,
+    const int lut_size,
     const int n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    int label = labels[idx];
-    if (label < 0) {
-        labels[idx] = 0;
-        return;
-    }
-
-    // Binary search for root in unique_roots array
-    int lo = 0, hi = num_roots - 1;
-    int compact = 0;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (unique_roots[mid] == label) {
-            compact = root_to_compact[mid];
-            break;
-        } else if (unique_roots[mid] < label) {
-            lo = mid + 1;
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += stride) {
+        int label = labels[idx];
+        if (label < 0) {
+            labels[idx] = 0;
         } else {
-            hi = mid - 1;
+            // Direct lookup: compact_lut[label] gives compact ID
+            labels[idx] = (label < lut_size) ? compact_lut[label] : 0;
         }
     }
-    labels[idx] = compact;
 }
 """

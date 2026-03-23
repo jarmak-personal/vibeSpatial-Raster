@@ -12,7 +12,10 @@ try:
 except ImportError:
     HAS_GPU = False
 
-pytestmark = pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not HAS_GPU, reason="CuPy not available"),
+]
 
 
 @pytest.fixture
@@ -221,6 +224,19 @@ class TestSlope:
         slope = result.to_numpy()
         # Interior should have nonzero slope
         assert slope[5, 5] > 0.0
+
+    def test_nodata_propagated(self):
+        from vibespatial.raster.algebra import raster_slope
+        from vibespatial.raster.buffers import from_numpy
+
+        data = np.ones((10, 10)) * 100.0
+        data[5, 5] = -9999.0
+        raster = from_numpy(data, nodata=-9999.0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 10.0))
+        result = raster_slope(raster)
+        out = result.to_numpy()
+        # Handle both 2D and 3D output shapes
+        pixel = out[0, 5, 5] if out.ndim == 3 else out[5, 5]
+        assert pixel == pytest.approx(-9999.0)
 
 
 class TestAspect:

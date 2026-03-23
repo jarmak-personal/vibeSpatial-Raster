@@ -25,16 +25,26 @@ from vibespatial.raster.buffers import (
 # ---------------------------------------------------------------------------
 
 _RASTERIZE_KERNEL_SOURCE = r"""
+// -----------------------------------------------------------------------
+// Shared-memory tile size for polygon bounding-box caching.
+// Each block cooperatively loads TILE_POLYS bounding boxes (4 doubles
+// each = 32 bytes) into shared memory so that the AABB pre-filter reads
+// from SMEM instead of global memory.  This eliminates redundant global
+// loads when many threads in the same block test the same polygons.
+// -----------------------------------------------------------------------
+#define TILE_POLYS 64
+
 extern "C" __device__ inline bool ring_contains_point(
-    double px, double py,
-    const double* x, const double* y,
-    int coord_start, int coord_end
+    const double px, const double py,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int coord_start, const int coord_end
 ) {
     bool inside = false;
     if ((coord_end - coord_start) < 2) return false;
     for (int c = coord_start + 1; c < coord_end; ++c) {
-        double ax = x[c - 1], ay = y[c - 1];
-        double bx = x[c],     by = y[c];
+        const double ax = x[c - 1], ay = y[c - 1];
+        const double bx = x[c],     by = y[c];
         if (((ay > py) != (by > py)) &&
             (px <= (((bx - ax) * (py - ay)) / (by - ay)) + ax)) {
             inside = !inside;
@@ -44,57 +54,93 @@ extern "C" __device__ inline bool ring_contains_point(
 }
 
 extern "C" __global__ void rasterize_polygons(
-    double* out,
-    const double* poly_x,
-    const double* poly_y,
-    const int* geom_offsets,
-    const int* ring_offsets,
-    const double* values,
-    const double* bounds,    // (n_poly, 4): minx, miny, maxx, maxy
-    int n_poly,
-    double affine_a, double affine_b, double affine_c,
-    double affine_d, double affine_e, double affine_f,
-    double fill_value,
-    int width, int height
+    double* __restrict__       out,
+    const double* __restrict__ poly_x,
+    const double* __restrict__ poly_y,
+    const int* __restrict__    geom_offsets,
+    const int* __restrict__    ring_offsets,
+    const double* __restrict__ values,
+    const double* __restrict__ bounds,    // (n_poly, 4): minx, miny, maxx, maxy
+    const int                  n_poly,
+    const int                  n_pixels,
+    const double               affine_a,
+    const double               affine_b,
+    const double               affine_c,
+    const double               affine_d,
+    const double               affine_e,
+    const double               affine_f,
+    const double               fill_value,
+    const int                  width,
+    const int                  height
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= width * height) return;
+    // --- shared-memory tile for polygon AABBs (4 doubles per polygon) ---
+    __shared__ double s_bounds[TILE_POLYS * 4];
 
-    int row = idx / width;
-    int col = idx % width;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = (idx < n_pixels);
 
-    // Pixel center world coordinates from affine
-    double wx = affine_a * (col + 0.5) + affine_b * (row + 0.5) + affine_c;
-    double wy = affine_d * (col + 0.5) + affine_e * (row + 0.5) + affine_f;
-
+    // Compute pixel coordinates only for active threads (avoid garbage reads)
+    double wx = 0.0, wy = 0.0;
     double result = fill_value;
+    if (active) {
+        const int row = idx / width;
+        const int col = idx - row * width;  // faster than idx % width
 
-    // Test against each polygon (last match wins for overlaps)
-    for (int p = 0; p < n_poly; ++p) {
-        // Bounds check first
-        int bb = p * 4;
-        if (wx < bounds[bb] || wx > bounds[bb+2] ||
-            wy < bounds[bb+1] || wy > bounds[bb+3]) {
-            continue;
-        }
-
-        // Ring-based PIP test
-        int ring_start = geom_offsets[p];
-        int ring_end = geom_offsets[p + 1];
-        bool inside = false;
-        for (int ring = ring_start; ring < ring_end; ++ring) {
-            int cs = ring_offsets[ring];
-            int ce = ring_offsets[ring + 1];
-            if (ring_contains_point(wx, wy, poly_x, poly_y, cs, ce)) {
-                inside = !inside;
-            }
-        }
-        if (inside) {
-            result = values[p];
-        }
+        // Pixel center world coordinates from affine (computed once)
+        const double half_col = col + 0.5;
+        const double half_row = row + 0.5;
+        wx = affine_a * half_col + affine_b * half_row + affine_c;
+        wy = affine_d * half_col + affine_e * half_row + affine_f;
     }
 
-    out[idx] = result;
+    // Process polygons in tiles of TILE_POLYS for shared-memory AABB caching.
+    // ALL threads in the block participate in the cooperative load and
+    // __syncthreads() regardless of whether they are active, which avoids
+    // deadlocks.
+    for (int tile_start = 0; tile_start < n_poly; tile_start += TILE_POLYS) {
+        const int tile_end = min(tile_start + TILE_POLYS, n_poly);
+        const int tile_count = tile_end - tile_start;
+
+        // Cooperative load: each thread loads one or more AABB entries
+        for (int t = threadIdx.x; t < tile_count * 4; t += blockDim.x) {
+            s_bounds[t] = bounds[(tile_start * 4) + t];
+        }
+        __syncthreads();
+
+        // Test each polygon in this tile (only active threads)
+        if (active) {
+            for (int tp = 0; tp < tile_count; ++tp) {
+                const int sb = tp * 4;
+                // AABB pre-filter from shared memory
+                if (wx < s_bounds[sb]     || wx > s_bounds[sb + 2] ||
+                    wy < s_bounds[sb + 1] || wy > s_bounds[sb + 3]) {
+                    continue;
+                }
+
+                // Full ring-based PIP test (global memory for geometry data)
+                const int p = tile_start + tp;
+                const int ring_start = geom_offsets[p];
+                const int ring_end   = geom_offsets[p + 1];
+                bool inside = false;
+                for (int ring = ring_start; ring < ring_end; ++ring) {
+                    const int cs = ring_offsets[ring];
+                    const int ce = ring_offsets[ring + 1];
+                    if (ring_contains_point(wx, wy, poly_x, poly_y, cs, ce)) {
+                        inside = !inside;
+                    }
+                }
+                if (inside) {
+                    result = values[p];
+                }
+            }
+        }
+
+        __syncthreads();  // ensure tile is consumed before next load
+    }
+
+    if (active) {
+        out[idx] = result;
+    }
 }
 """
 
@@ -266,7 +312,7 @@ def rasterize_gpu(
     total_pixels = grid_spec.width * grid_spec.height
     d_out = cp.full(total_pixels, grid_spec.fill_value, dtype=np.float64)
 
-    # Compile and launch kernel
+    # Compile kernel with shared-memory AABB tiling
     runtime = get_cuda_runtime()
     cache_key = make_kernel_cache_key("rasterize_polygons", _RASTERIZE_KERNEL_SOURCE)
     kernels = runtime.compile_kernels(
@@ -275,10 +321,14 @@ def rasterize_gpu(
         kernel_names=("rasterize_polygons",),
     )
 
-    block_size = 256
-    grid_size = (total_pixels + block_size - 1) // block_size
+    # Shared memory: TILE_POLYS(64) * 4 doubles * 8 bytes = 2048 bytes
+    smem_bytes = 64 * 4 * 8
 
-    a, b, c, d, e, f = grid_spec.affine
+    # Occupancy-based launch config (never hardcode block size)
+    kernel = kernels["rasterize_polygons"]
+    grid_dim, block_dim = runtime.launch_config(kernel, total_pixels, shared_mem_bytes=smem_bytes)
+
+    af_a, af_b, af_c, af_d, af_e, af_f = grid_spec.affine
 
     from vibespatial.cuda_runtime import KERNEL_PARAM_F64, KERNEL_PARAM_I32, KERNEL_PARAM_PTR
 
@@ -292,12 +342,13 @@ def rasterize_gpu(
             d_values.data.ptr,
             d_bounds.data.ptr,
             n_poly,
-            a,
-            b,
-            c,
-            d,
-            e,
-            f,
+            total_pixels,
+            af_a,
+            af_b,
+            af_c,
+            af_d,
+            af_e,
+            af_f,
             float(grid_spec.fill_value),
             grid_spec.width,
             grid_spec.height,
@@ -311,23 +362,25 @@ def rasterize_gpu(
             KERNEL_PARAM_PTR,  # values
             KERNEL_PARAM_PTR,  # bounds
             KERNEL_PARAM_I32,  # n_poly
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,  # affine a,b,c
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_F64,  # affine d,e,f
+            KERNEL_PARAM_I32,  # n_pixels
+            KERNEL_PARAM_F64,  # affine_a
+            KERNEL_PARAM_F64,  # affine_b
+            KERNEL_PARAM_F64,  # affine_c
+            KERNEL_PARAM_F64,  # affine_d
+            KERNEL_PARAM_F64,  # affine_e
+            KERNEL_PARAM_F64,  # affine_f
             KERNEL_PARAM_F64,  # fill_value
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,  # width, height
+            KERNEL_PARAM_I32,  # width
+            KERNEL_PARAM_I32,  # height
         ),
     )
 
     runtime.launch(
-        kernel=kernels["rasterize_polygons"],
-        grid=(grid_size, 1, 1),
-        block=(block_size, 1, 1),
+        kernel=kernel,
+        grid=grid_dim,
+        block=block_dim,
         params=params,
+        shared_mem_bytes=smem_bytes,
     )
 
     result_data = cp.asnumpy(d_out).reshape(grid_spec.height, grid_spec.width)

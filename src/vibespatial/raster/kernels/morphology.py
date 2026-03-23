@@ -2,9 +2,41 @@
 
 Bead: GPU morphology stencil kernels (erode/dilate) with shared memory halo.
 Uses 3x3 structuring elements with (16,16) thread blocks and 1-pixel halo.
+
+Halo loading uses the standard tile-edge pattern: border threads (tx==0,
+tx==TILE_W-1, ty==0, ty==TILE_H-1) load halo cells at *fixed* tile-edge
+shared-memory positions using clamped global coordinates.  This eliminates
+the fragile ``gx == width - 1`` dual-condition pattern that caused
+overlapping writes and incorrect results at tile boundaries.
 """
 
 from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# Tile dimensions — must match the #define TILE_W / TILE_H in kernel sources.
+# Dispatch code imports these to size thread blocks and grids.
+# ---------------------------------------------------------------------------
+MORPH_TILE_W: int = 16
+MORPH_TILE_H: int = 16
+
+# ---------------------------------------------------------------------------
+# Shared helper: safe global-to-shared halo load with clamping
+# ---------------------------------------------------------------------------
+#
+# The halo loading strategy:
+#   - Each thread loads its center cell at tile[ty+1][tx+1].
+#   - The 4 border thread-rows/columns of the tile load the 1-pixel halo
+#     ring at FIXED tile-edge positions (column 0, column TILE_W+1,
+#     row 0, row TILE_H+1).
+#   - Global coordinates for halo cells are computed from the tile origin
+#     (blockIdx * TILE), NOT from the thread's own (gx, gy).
+#   - Out-of-bounds global coordinates produce 0 (correct for morphology
+#     where out-of-bounds pixels are treated as background).
+#   - 4 corner cells are loaded by the 4 corner threads of the tile.
+#
+# This pattern has NO overlapping shared-memory writes (each shared-memory
+# cell is written by exactly one thread) and no dual-condition branches.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Binary erosion kernel -- shared memory tile with 1-pixel halo
@@ -13,6 +45,17 @@ from __future__ import annotations
 BINARY_ERODE_KERNEL_SOURCE = r"""
 #define TILE_W 16
 #define TILE_H 16
+
+/* Safe global memory fetch: returns 0 for out-of-bounds coordinates. */
+__device__ __forceinline__
+unsigned char safe_fetch(
+    const unsigned char* __restrict__ data,
+    int x, int y, int width, int height
+) {
+    if (x >= 0 && x < width && y >= 0 && y < height)
+        return data[y * width + x];
+    return 0;
+}
 
 extern "C" __global__
 void binary_erode(
@@ -24,53 +67,54 @@ void binary_erode(
 ) {
     __shared__ unsigned char tile[TILE_H + 2][TILE_W + 2];
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int gx = blockIdx.x * TILE_W + tx;
-    int gy = blockIdx.y * TILE_H + ty;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    /* Global coords for the tile origin (top-left corner of the center region). */
+    const int tile_ox = blockIdx.x * TILE_W;
+    const int tile_oy = blockIdx.y * TILE_H;
+    /* Global coords for this thread's pixel. */
+    const int gx = tile_ox + tx;
+    const int gy = tile_oy + ty;
 
-    /* Load center of tile */
-    unsigned char center_val = (gx < width && gy < height)
-                                   ? input[gy * width + gx] : 0;
-    tile[ty + 1][tx + 1] = center_val;
+    /* ---- Load center cell ---- */
+    tile[ty + 1][tx + 1] = safe_fetch(input, gx, gy, width, height);
 
-    /* Load left halo */
+    /* ---- Load halo edges (4 sides) ---- */
+    /* Left halo column (shared col 0): loaded by tx == 0 */
     if (tx == 0) {
-        tile[ty + 1][0] = (gx > 0 && gy < height)
-                              ? input[gy * width + (gx - 1)] : 0;
+        tile[ty + 1][0] = safe_fetch(input, tile_ox - 1, gy, width, height);
     }
-    /* Load right halo */
-    if (tx == TILE_W - 1 || gx == width - 1) {
-        tile[ty + 1][tx + 2] = (gx + 1 < width && gy < height)
-                                    ? input[gy * width + (gx + 1)] : 0;
+    /* Right halo column (shared col TILE_W + 1): loaded by tx == TILE_W - 1 */
+    if (tx == TILE_W - 1) {
+        tile[ty + 1][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, gy, width, height);
     }
-    /* Load top halo */
+    /* Top halo row (shared row 0): loaded by ty == 0 */
     if (ty == 0) {
-        tile[0][tx + 1] = (gy > 0 && gx < width)
-                              ? input[(gy - 1) * width + gx] : 0;
+        tile[0][tx + 1] = safe_fetch(input, gx, tile_oy - 1, width, height);
     }
-    /* Load bottom halo */
-    if (ty == TILE_H - 1 || gy == height - 1) {
-        tile[ty + 2][tx + 1] = (gy + 1 < height && gx < width)
-                                    ? input[(gy + 1) * width + gx] : 0;
+    /* Bottom halo row (shared row TILE_H + 1): loaded by ty == TILE_H - 1 */
+    if (ty == TILE_H - 1) {
+        tile[TILE_H + 1][tx + 1] = safe_fetch(
+            input, gx, tile_oy + TILE_H, width, height);
     }
-    /* Load corner halos */
+
+    /* ---- Load 4 corner halo cells ---- */
     if (tx == 0 && ty == 0) {
-        tile[0][0] = (gx > 0 && gy > 0)
-                         ? input[(gy - 1) * width + (gx - 1)] : 0;
+        tile[0][0] = safe_fetch(
+            input, tile_ox - 1, tile_oy - 1, width, height);
     }
-    if ((tx == TILE_W - 1 || gx == width - 1) && ty == 0) {
-        tile[0][tx + 2] = (gx + 1 < width && gy > 0)
-                              ? input[(gy - 1) * width + (gx + 1)] : 0;
+    if (tx == TILE_W - 1 && ty == 0) {
+        tile[0][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, tile_oy - 1, width, height);
     }
-    if (tx == 0 && (ty == TILE_H - 1 || gy == height - 1)) {
-        tile[ty + 2][0] = (gx > 0 && gy + 1 < height)
-                              ? input[(gy + 1) * width + (gx - 1)] : 0;
+    if (tx == 0 && ty == TILE_H - 1) {
+        tile[TILE_H + 1][0] = safe_fetch(
+            input, tile_ox - 1, tile_oy + TILE_H, width, height);
     }
-    if ((tx == TILE_W - 1 || gx == width - 1) &&
-        (ty == TILE_H - 1 || gy == height - 1)) {
-        tile[ty + 2][tx + 2] = (gx + 1 < width && gy + 1 < height)
-                                    ? input[(gy + 1) * width + (gx + 1)] : 0;
+    if (tx == TILE_W - 1 && ty == TILE_H - 1) {
+        tile[TILE_H + 1][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, tile_oy + TILE_H, width, height);
     }
 
     __syncthreads();
@@ -100,6 +144,17 @@ BINARY_DILATE_KERNEL_SOURCE = r"""
 #define TILE_W 16
 #define TILE_H 16
 
+/* Safe global memory fetch: returns 0 for out-of-bounds coordinates. */
+__device__ __forceinline__
+unsigned char safe_fetch(
+    const unsigned char* __restrict__ data,
+    int x, int y, int width, int height
+) {
+    if (x >= 0 && x < width && y >= 0 && y < height)
+        return data[y * width + x];
+    return 0;
+}
+
 extern "C" __global__
 void binary_dilate(
     const unsigned char* __restrict__ input,
@@ -110,53 +165,54 @@ void binary_dilate(
 ) {
     __shared__ unsigned char tile[TILE_H + 2][TILE_W + 2];
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int gx = blockIdx.x * TILE_W + tx;
-    int gy = blockIdx.y * TILE_H + ty;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    /* Global coords for the tile origin (top-left corner of the center region). */
+    const int tile_ox = blockIdx.x * TILE_W;
+    const int tile_oy = blockIdx.y * TILE_H;
+    /* Global coords for this thread's pixel. */
+    const int gx = tile_ox + tx;
+    const int gy = tile_oy + ty;
 
-    /* Load center of tile */
-    unsigned char center_val = (gx < width && gy < height)
-                                   ? input[gy * width + gx] : 0;
-    tile[ty + 1][tx + 1] = center_val;
+    /* ---- Load center cell ---- */
+    tile[ty + 1][tx + 1] = safe_fetch(input, gx, gy, width, height);
 
-    /* Load left halo */
+    /* ---- Load halo edges (4 sides) ---- */
+    /* Left halo column (shared col 0): loaded by tx == 0 */
     if (tx == 0) {
-        tile[ty + 1][0] = (gx > 0 && gy < height)
-                              ? input[gy * width + (gx - 1)] : 0;
+        tile[ty + 1][0] = safe_fetch(input, tile_ox - 1, gy, width, height);
     }
-    /* Load right halo */
-    if (tx == TILE_W - 1 || gx == width - 1) {
-        tile[ty + 1][tx + 2] = (gx + 1 < width && gy < height)
-                                    ? input[gy * width + (gx + 1)] : 0;
+    /* Right halo column (shared col TILE_W + 1): loaded by tx == TILE_W - 1 */
+    if (tx == TILE_W - 1) {
+        tile[ty + 1][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, gy, width, height);
     }
-    /* Load top halo */
+    /* Top halo row (shared row 0): loaded by ty == 0 */
     if (ty == 0) {
-        tile[0][tx + 1] = (gy > 0 && gx < width)
-                              ? input[(gy - 1) * width + gx] : 0;
+        tile[0][tx + 1] = safe_fetch(input, gx, tile_oy - 1, width, height);
     }
-    /* Load bottom halo */
-    if (ty == TILE_H - 1 || gy == height - 1) {
-        tile[ty + 2][tx + 1] = (gy + 1 < height && gx < width)
-                                    ? input[(gy + 1) * width + gx] : 0;
+    /* Bottom halo row (shared row TILE_H + 1): loaded by ty == TILE_H - 1 */
+    if (ty == TILE_H - 1) {
+        tile[TILE_H + 1][tx + 1] = safe_fetch(
+            input, gx, tile_oy + TILE_H, width, height);
     }
-    /* Load corner halos */
+
+    /* ---- Load 4 corner halo cells ---- */
     if (tx == 0 && ty == 0) {
-        tile[0][0] = (gx > 0 && gy > 0)
-                         ? input[(gy - 1) * width + (gx - 1)] : 0;
+        tile[0][0] = safe_fetch(
+            input, tile_ox - 1, tile_oy - 1, width, height);
     }
-    if ((tx == TILE_W - 1 || gx == width - 1) && ty == 0) {
-        tile[0][tx + 2] = (gx + 1 < width && gy > 0)
-                              ? input[(gy - 1) * width + (gx + 1)] : 0;
+    if (tx == TILE_W - 1 && ty == 0) {
+        tile[0][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, tile_oy - 1, width, height);
     }
-    if (tx == 0 && (ty == TILE_H - 1 || gy == height - 1)) {
-        tile[ty + 2][0] = (gx > 0 && gy + 1 < height)
-                              ? input[(gy + 1) * width + (gx - 1)] : 0;
+    if (tx == 0 && ty == TILE_H - 1) {
+        tile[TILE_H + 1][0] = safe_fetch(
+            input, tile_ox - 1, tile_oy + TILE_H, width, height);
     }
-    if ((tx == TILE_W - 1 || gx == width - 1) &&
-        (ty == TILE_H - 1 || gy == height - 1)) {
-        tile[ty + 2][tx + 2] = (gx + 1 < width && gy + 1 < height)
-                                    ? input[(gy + 1) * width + (gx + 1)] : 0;
+    if (tx == TILE_W - 1 && ty == TILE_H - 1) {
+        tile[TILE_H + 1][TILE_W + 1] = safe_fetch(
+            input, tile_ox + TILE_W, tile_oy + TILE_H, width, height);
     }
 
     __syncthreads();

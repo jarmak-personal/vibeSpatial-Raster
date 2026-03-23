@@ -19,6 +19,7 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticKind,
     from_numpy,
 )
+from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,17 @@ def label_gpu(
     Uses NVRTC kernels: init_labels -> local_merge -> pointer_jump (iterate)
     -> relabel to compact sequential labels 1..N.
 
+    Optimizations over naive union-find:
+    - Path-splitting find_root with atomicCAS (reduces tree height in-place)
+    - Lock-free union via atomicCAS (avoids atomicMin serialization on roots)
+    - Asymmetric neighbor scan (each edge processed once, not twice)
+    - Pointer jump runs to full convergence (no fixed iteration cap)
+    - Compact relabel via direct LUT (O(1) per pixel, no binary search)
+    - All relabel computation on device (no D->H->D ping-pong)
+    - Occupancy-based launch configs (no hardcoded block sizes)
+    - Grid-stride loops in 1D kernels for wave-quantization robustness
+    - Single d_changed buffer reused (no per-iteration allocation)
+
     Parameters
     ----------
     raster : OwnedRasterArray
@@ -156,33 +168,41 @@ def label_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("connected component labeling requires a single-band raster")
-        data = data[0]
+    # --- Prepare data on device (zero-copy: no D->H->D ping-pong) ---
+    if raster.band_count != 1:
+        raise ValueError("connected component labeling requires a single-band raster")
 
-    height, width = data.shape
+    height, width = raster.height, raster.width
     n = height * width
 
-    # Build foreground mask on host, then transfer once
-    foreground_host = (data != 0).astype(np.uint8)
+    # Move raster to device (no-op if already device-resident)
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="label_gpu requires device-resident data",
+    )
+    d_data = raster.device_data()
+
+    # Squeeze band dimension if 3D -> get a 2D view for the ravel below
+    if d_data.ndim == 3:
+        d_data = d_data[0]
+
+    # Build foreground mask entirely on device
+    d_foreground = (d_data != 0).astype(cp.uint8)
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            foreground_host &= (~np.isnan(data)).astype(np.uint8)
+            d_foreground &= (~cp.isnan(d_data)).astype(cp.uint8)
         else:
-            foreground_host &= (data != raster.nodata).astype(np.uint8)
+            d_foreground &= (d_data != raster.nodata).astype(cp.uint8)
 
-    # H->D transfer (only transfer at start)
-    d_foreground = cp.asarray(np.ascontiguousarray(foreground_host.ravel()))
+    # Flatten to 1D for the CCL kernels
+    d_foreground = cp.ascontiguousarray(d_foreground.ravel())
 
-    # Allocate device buffers
+    # Allocate device buffers -- single allocation, reused across iterations
     d_labels = cp.empty(n, dtype=np.int32)
     d_changed = cp.zeros(1, dtype=np.int32)
 
     # --- Compile kernels ---
-    # Init labels kernel
     init_key = make_kernel_cache_key("init_labels", INIT_LABELS_SOURCE)
     init_kernels = runtime.compile_kernels(
         cache_key=init_key,
@@ -190,7 +210,6 @@ def label_gpu(
         kernel_names=("init_labels",),
     )
 
-    # Merge kernel (4c or 8c)
     if connectivity == 4:
         merge_source = LOCAL_MERGE_4C_SOURCE
         merge_name = "local_merge_4c"
@@ -205,7 +224,6 @@ def label_gpu(
         kernel_names=(merge_name,),
     )
 
-    # Pointer jump kernel
     pj_key = make_kernel_cache_key("pointer_jump", POINTER_JUMP_SOURCE)
     pj_kernels = runtime.compile_kernels(
         cache_key=pj_key,
@@ -213,7 +231,6 @@ def label_gpu(
         kernel_names=("pointer_jump",),
     )
 
-    # Relabel kernel
     relabel_key = make_kernel_cache_key("relabel", RELABEL_SOURCE)
     relabel_kernels = runtime.compile_kernels(
         cache_key=relabel_key,
@@ -221,10 +238,30 @@ def label_gpu(
         kernel_names=("relabel",),
     )
 
-    # --- Phase 1: Init labels ---
-    block_1d = (256, 1, 1)
-    grid_1d = ((n + 255) // 256, 1, 1)
+    # --- Occupancy-based launch configs ---
+    grid_1d, block_1d = runtime.launch_config(init_kernels["init_labels"], n)
 
+    # For 2D merge kernel, use occupancy API to pick block size, then
+    # derive a square-ish 2D tile from it.
+    merge_block_size = runtime.optimal_block_size(merge_kernels[merge_name])
+    # Choose largest power-of-2 tile dim that fits: e.g., 256->16x16, 1024->32x32
+    tile_dim = 1
+    while tile_dim * tile_dim * 4 <= merge_block_size:
+        tile_dim *= 2
+    # tile_dim is now the largest value where tile_dim^2 <= merge_block_size
+    # Clamp to at least 8 for reasonable 2D tile
+    tile_dim = max(8, tile_dim)
+    block_2d = (tile_dim, tile_dim, 1)
+    grid_2d = (
+        (width + tile_dim - 1) // tile_dim,
+        (height + tile_dim - 1) // tile_dim,
+        1,
+    )
+
+    # Pointer jump and relabel use 1D launch config
+    pj_grid, pj_block = runtime.launch_config(pj_kernels["pointer_jump"], n)
+
+    # --- Phase 1: Init labels ---
     runtime.launch(
         kernel=init_kernels["init_labels"],
         grid=grid_1d,
@@ -236,21 +273,29 @@ def label_gpu(
     )
 
     # --- Phases 2-3: Iterate merge + pointer jump until convergence ---
-    block_2d = (16, 16, 1)
-    grid_2d = ((width + 15) // 16, (height + 15) // 16, 1)
-
+    # Standard union-find convergence: repeat (merge, check, flatten) until
+    # merge discovers no new unions. The merge kernel uses path-splitting
+    # find_root and lock-free union_roots, so convergence is typically 1-3
+    # outer iterations for practical raster data.
     max_iterations = 1000
+    iterations_done = 0
     for _iteration in range(max_iterations):
-        # Reset changed flag
+        # Reset changed flag (reuse same buffer, no allocation)
         d_changed.fill(0)
 
-        # Phase 2: Local merge
+        # Phase 2: Local merge (asymmetric neighbor scan)
         runtime.launch(
             kernel=merge_kernels[merge_name],
             grid=grid_2d,
             block=block_2d,
             params=(
-                (d_labels.data.ptr, d_foreground.data.ptr, width, height, d_changed.data.ptr),
+                (
+                    d_labels.data.ptr,
+                    d_foreground.data.ptr,
+                    width,
+                    height,
+                    d_changed.data.ptr,
+                ),
                 (
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
@@ -261,43 +306,68 @@ def label_gpu(
             ),
         )
 
-        # Phase 3: Pointer jumping (multiple rounds per iteration)
-        for _pj in range(10):
-            d_pj_changed = cp.zeros(1, dtype=np.int32)
+        iterations_done = _iteration + 1
+
+        # Check if merge found any new unions (single D->H scalar read)
+        if int(d_changed.item()) == 0:
+            # No new unions -- flatten labels to roots and we are done.
+            # Run pointer_jump to fixpoint so every pixel points to its root.
+            while True:
+                d_changed.fill(0)
+                runtime.launch(
+                    kernel=pj_kernels["pointer_jump"],
+                    grid=pj_grid,
+                    block=pj_block,
+                    params=(
+                        (d_labels.data.ptr, n, d_changed.data.ptr),
+                        (KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_PTR),
+                    ),
+                )
+                if int(d_changed.item()) == 0:
+                    break
+            break
+
+        # Merge found new unions -- flatten labels before next merge pass.
+        # Pointer-jump to fixpoint so the next merge sees true roots.
+        while True:
+            d_changed.fill(0)
             runtime.launch(
                 kernel=pj_kernels["pointer_jump"],
-                grid=grid_1d,
-                block=block_1d,
+                grid=pj_grid,
+                block=pj_block,
                 params=(
-                    (d_labels.data.ptr, n, d_pj_changed.data.ptr),
+                    (d_labels.data.ptr, n, d_changed.data.ptr),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_PTR),
                 ),
             )
-            if int(d_pj_changed.item()) == 0:
+            if int(d_changed.item()) == 0:
                 break
 
-        if int(d_changed.item()) == 0:
-            break
+    # --- Phase 4: Compact relabel entirely on device ---
+    # Build a direct lookup table on device: compact_lut[root_label] = compact_id
+    # This avoids the D->H->D ping-pong of the old np.unique approach.
 
-    iterations_done = _iteration + 1
+    # Find unique roots on device using CuPy
+    d_fg_mask = d_labels >= 0
+    d_fg_count = int(d_fg_mask.sum().item())
 
-    # --- Phase 4: Compact relabel using CuPy sort + unique ---
-    # Extract only foreground labels
-    h_labels = cp.asnumpy(d_labels)
-    fg_mask = h_labels >= 0
-    if not fg_mask.any():
+    if d_fg_count == 0:
         # No foreground pixels at all
+        host_labels = np.zeros((height, width), dtype=np.int32)
+        elapsed = time.perf_counter() - t0
         result = from_numpy(
-            np.zeros((height, width), dtype=np.int32),
+            host_labels,
             nodata=0,
             affine=raster.affine,
             crs=raster.crs,
         )
-        elapsed = time.perf_counter() - t0
         result.diagnostics.append(
             RasterDiagnosticEvent(
                 kind=RasterDiagnosticKind.RUNTIME,
-                detail=f"label_gpu components=0 connectivity={connectivity} iterations={iterations_done} elapsed={elapsed:.3f}s",
+                detail=(
+                    f"label_gpu components=0 connectivity={connectivity} "
+                    f"iterations={iterations_done} elapsed={elapsed:.3f}s"
+                ),
                 residency=result.residency,
                 visible_to_user=True,
                 elapsed_seconds=elapsed,
@@ -305,26 +375,29 @@ def label_gpu(
         )
         return result
 
-    # Find unique root labels and build compact mapping
-    unique_roots = np.unique(h_labels[fg_mask])
-    num_components = len(unique_roots)
+    # After full pointer jumping, every foreground pixel's label points
+    # directly to its root. Roots are pixels where labels[i] == i.
+    # Find unique roots on device.
+    d_unique_roots = cp.unique(d_labels[d_fg_mask])
+    num_components = d_unique_roots.shape[0]
 
-    # Build compact IDs 1..N
-    compact_ids = np.arange(1, num_components + 1, dtype=np.int32)
+    # Build direct LUT on device: compact_lut is sized to max_root+1 (not n),
+    # since roots are pixel indices and we only need entries up to the largest root.
+    # This can save significant memory on sparse rasters.
+    max_root = int(d_unique_roots.max().item()) + 1
+    d_compact_lut = cp.zeros(max_root, dtype=np.int32)
+    # Scatter compact IDs into LUT at root positions
+    d_compact_lut[d_unique_roots] = cp.arange(1, num_components + 1, dtype=np.int32)
 
-    # Transfer mapping to device
-    d_unique_roots = cp.asarray(unique_roots.astype(np.int32))
-    d_compact_ids = cp.asarray(compact_ids)
-
-    # Launch relabel kernel
+    # Launch relabel kernel with direct LUT (lut_size = max_root)
+    rl_grid, rl_block = runtime.launch_config(relabel_kernels["relabel"], n)
     runtime.launch(
         kernel=relabel_kernels["relabel"],
-        grid=grid_1d,
-        block=block_1d,
+        grid=rl_grid,
+        block=rl_block,
         params=(
-            (d_labels.data.ptr, d_compact_ids.data.ptr, d_unique_roots.data.ptr, num_components, n),
+            (d_labels.data.ptr, d_compact_lut.data.ptr, max_root, n),
             (
-                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
@@ -333,12 +406,15 @@ def label_gpu(
         ),
     )
 
-    # --- D->H transfer (final) ---
+    # --- D->H transfer (final, single transfer) ---
     host_labels = cp.asnumpy(d_labels).reshape(height, width)
+
+    # num_components is already an int (from d_unique_roots.shape[0])
+    num_components_int = int(num_components)
 
     elapsed = time.perf_counter() - t0
     result = from_numpy(
-        host_labels.astype(np.int32),
+        host_labels,
         nodata=0,
         affine=raster.affine,
         crs=raster.crs,
@@ -347,7 +423,7 @@ def label_gpu(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(
-                f"label_gpu components={num_components} connectivity={connectivity} "
+                f"label_gpu components={num_components_int} connectivity={connectivity} "
                 f"iterations={iterations_done} pixels={n} elapsed={elapsed:.3f}s"
             ),
             residency=result.residency,
@@ -399,6 +475,8 @@ def morphology_gpu(
     from vibespatial.raster.kernels.morphology import (
         BINARY_DILATE_KERNEL_SOURCE,
         BINARY_ERODE_KERNEL_SOURCE,
+        MORPH_TILE_H,
+        MORPH_TILE_W,
     )
 
     valid_ops = ("erode", "dilate", "open", "close")
@@ -452,8 +530,12 @@ def morphology_gpu(
         kernel_names=("binary_dilate",),
     )
 
-    block_2d = (16, 16, 1)
-    grid_2d = ((width + 15) // 16, (height + 15) // 16, 1)
+    block_2d = (MORPH_TILE_W, MORPH_TILE_H, 1)
+    grid_2d = (
+        (width + MORPH_TILE_W - 1) // MORPH_TILE_W,
+        (height + MORPH_TILE_H - 1) // MORPH_TILE_H,
+        1,
+    )
 
     def _run_erode(d_in: object, d_out: object) -> None:
         runtime.launch(

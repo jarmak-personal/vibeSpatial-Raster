@@ -303,6 +303,7 @@ class TestEdgeChaining:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
 class TestPolygonizeGPU:
     """GPU marching-squares polygonize tests.
 

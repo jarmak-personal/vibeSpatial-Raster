@@ -115,16 +115,34 @@ def _nvimgcodec_dtype_to_numpy(nvimgcodec_dtype) -> np.dtype | None:
 # ---------------------------------------------------------------------------
 
 
-def _extract_geo_metadata(code_stream):
-    """Attempt to extract geo metadata dict from a CodeStream.
+def _extract_geo_metadata(code_stream, decoder=None):
+    """Extract geo metadata from a CodeStream via Decoder.get_metadata().
+
+    Uses the v0.7+ ``Decoder.get_metadata(kind=GEO)`` API which returns
+    GeoTIFF keys (MODEL_PIXEL_SCALE, MODEL_TIEPOINT, CRS, etc.) as a
+    JSON-encoded ``Metadata`` object.
 
     Returns (affine, crs) tuple via the geokeys parser, or (None, None).
     """
     try:
-        geo_metadata = code_stream.metadata
-        if not isinstance(geo_metadata, dict) or not geo_metadata:
+        import json
+
+        import nvidia.nvimgcodec as nvimgcodec
+
+        if decoder is None:
+            decoder = _get_decoder()
+        if decoder is None:
             return None, None
+
+        metas = decoder.get_metadata(code_stream, kind=nvimgcodec.MetadataKind.GEO)
+        if not metas:
+            return None, None
+
+        # Parse JSON from .buffer (more reliable than .value which can truncate).
+        raw = metas[0].buffer.decode("utf-8").rstrip("\x00")
+        geo_metadata = json.loads(raw)
     except Exception:
+        logger.debug("Failed to read geo metadata from CodeStream", exc_info=True)
         return None, None
 
     try:
@@ -299,7 +317,7 @@ def nvimgcodec_read(
             out_width = arr.shape[1]
 
         # ---- Geo metadata ----
-        affine, crs = _extract_geo_metadata(cs)
+        affine, crs = _extract_geo_metadata(cs, decoder)
         if affine is None:
             affine = (1.0, 0.0, 0.0, 0.0, -1.0, 0.0)
 
