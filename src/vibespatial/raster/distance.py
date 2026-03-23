@@ -22,6 +22,7 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticKind,
     from_numpy,
 )
+from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -168,41 +169,49 @@ def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("distance transform requires a single-band raster")
-        data = data[0]
-
-    height, width = data.shape
+    # --- Prepare data on device (zero-copy: no D->H->D ping-pong) ---
+    height, width = raster.height, raster.width
     n = height * width
 
-    # Build foreground mask on host, then transfer once
-    foreground_host = (data != 0).astype(np.uint8)
+    # Move raster to device (no-op if already device-resident)
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="distance_transform_gpu requires device-resident data",
+    )
+    d_data = raster.device_data()
+
+    # Squeeze band dimension if 3D
+    if d_data.ndim == 3:
+        if d_data.shape[0] != 1:
+            raise ValueError("distance transform requires a single-band raster")
+        d_data = d_data[0]
+
+    # Build foreground mask entirely on device (nonzero and non-nodata = foreground)
+    d_foreground = (d_data != 0).astype(cp.uint8)
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            foreground_host &= (~np.isnan(data)).astype(np.uint8)
+            d_foreground &= (~cp.isnan(d_data)).astype(cp.uint8)
         else:
-            foreground_host &= (data != raster.nodata).astype(np.uint8)
+            d_foreground &= (d_data != raster.nodata).astype(cp.uint8)
 
-    # Build nodata mask on host
+    # Flatten to 1D for the JFA kernels
+    d_foreground = cp.ascontiguousarray(d_foreground.ravel())
+
+    # Build nodata mask on device
     has_nodata = raster.nodata is not None
     if has_nodata:
-        if np.isnan(raster.nodata):
-            nodata_mask_host = np.isnan(data).astype(np.uint8)
+        # device_nodata_mask() returns a bool CuPy array computed on device
+        d_nodata_bool = raster.device_nodata_mask()
+        if d_nodata_bool.ndim == 3:
+            d_nodata_bool = d_nodata_bool[0]
+        any_nodata = bool(cp.any(d_nodata_bool))
+        if any_nodata:
+            d_nodata_mask = cp.ascontiguousarray(d_nodata_bool.ravel().astype(cp.uint8))
         else:
-            nodata_mask_host = (data == raster.nodata).astype(np.uint8)
-        any_nodata = nodata_mask_host.any()
+            d_nodata_mask = None
     else:
         any_nodata = False
-
-    # H->D transfer (only transfers at start)
-    d_foreground = cp.asarray(np.ascontiguousarray(foreground_host.ravel()))
-
-    if any_nodata:
-        d_nodata_mask = cp.asarray(np.ascontiguousarray(nodata_mask_host.ravel()))
-    else:
         d_nodata_mask = None
 
     # Allocate device buffers: two seed buffers for ping-pong (SoA layout)
