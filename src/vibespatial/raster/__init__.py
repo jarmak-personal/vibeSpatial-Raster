@@ -82,6 +82,11 @@ __all__ = [
     "polygonize_gpu",
     "polygonize_to_gdf",
     "plan_polygonize_pipeline",
+    # Histogram / CDF / equalization
+    "raster_histogram",
+    "raster_cumulative_distribution",
+    "raster_histogram_equalize",
+    "raster_percentile",
     # NVRTC cache management (from vibespatial.cuda_runtime)
     "clear_nvrtc_cache",
     "nvrtc_cache_stats",
@@ -149,6 +154,16 @@ def __getattr__(name):
         from vibespatial.raster import polygonize
 
         return getattr(polygonize, name)
+    # Histogram / CDF / equalization
+    if name in (
+        "raster_histogram",
+        "raster_cumulative_distribution",
+        "raster_histogram_equalize",
+        "raster_percentile",
+    ):
+        from vibespatial.raster import histogram
+
+        return getattr(histogram, name)
     # NVRTC cache management
     if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
         from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats
