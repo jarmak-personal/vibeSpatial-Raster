@@ -92,6 +92,8 @@ __all__ = [
     "raster_morphology_tophat",
     "raster_morphology_blackhat",
     "make_structuring_element",
+    # Distance Transform
+    "raster_distance_transform",
     # Polygonize
     "polygonize_owned",
     "polygonize_gpu",
@@ -168,6 +170,11 @@ def __getattr__(name):
         from vibespatial.raster import label
 
         return getattr(label, name)
+    # Distance Transform
+    if name in ("raster_distance_transform",):
+        from vibespatial.raster import distance
+
+        return getattr(distance, name)
     # Polygonize
     if name in (
         "polygonize_owned",
