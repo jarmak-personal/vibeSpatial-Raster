@@ -545,3 +545,243 @@ result.diagnostics.append(
 - CUDA guarantees execution order within a single stream. Do NOT sync
   between consecutive launches on the same stream.
 - Keep sync calls before: `cp.asnumpy()`, `.get()`, `copy_device_to_host`.
+
+---
+
+## 12. Dtype-Templated Kernel Sources via `.format()`
+
+Rasters store native dtypes (uint8, int16, float32, float64). Kernel source
+strings use `{dtype}` placeholders that are filled at compile time via
+Python `.format()`. This avoids writing separate kernels per type.
+
+**Pattern** (see `kernels/hydrology.py`, `kernels/resample.py`):
+
+```python
+KERNEL_TEMPLATE = r"""
+extern "C" __global__
+void my_kernel(
+    const {dtype}* __restrict__ input,
+    {dtype}* __restrict__ output,
+    const int n
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    output[idx] = input[idx] * ({dtype})2.0;
+}}
+"""
+
+def get_kernel_source(dtype_name: str) -> str:
+    """Return kernel source for 'float' or 'double'."""
+    return KERNEL_TEMPLATE.format(dtype=dtype_name)
+```
+
+**Rules:**
+- Use `{{` and `}}` for literal braces in CUDA code (Python `.format()` escaping).
+- Map numpy dtypes to C type names: `float32 -> "float"`, `float64 -> "double"`.
+- For float32, use `f`-suffixed constants (`3.14f`) and math functions
+  (`sqrtf`, `fabsf`) to avoid implicit double promotion.
+
+---
+
+## 13. Runtime Expression Compilation
+
+The fused expression kernel (see `kernels/algebra.py`) compiles a
+user-supplied arithmetic expression into a single GPU pass at runtime.
+This avoids multiple kernel launches for chained element-wise ops.
+
+**Pattern:**
+
+```python
+from vibespatial.raster.kernels.algebra import build_expression_kernel_source
+
+# User writes: "a * 2.0 + sqrt(b)"
+# build_expression_kernel_source produces a complete NVRTC source with:
+#   - N input pointer parameters (const {dtype}* __restrict__ in_a, ...)
+#   - N nodata mask parameters (const unsigned char* __restrict__ mask_a, ...)
+#   - Grid-stride loop evaluating the expression per pixel
+#   - Nodata propagation: if ANY input is nodata, output is nodata
+#   - inf/nan guard: division-by-zero results become nodata
+
+source = build_expression_kernel_source(
+    expression="a * 2.0 + sqrt(b)",
+    var_names=("a", "b"),
+    dtype_name="double",  # or "float" for float32 rasters
+)
+# source is a complete NVRTC kernel string ready for compile_kernels()
+```
+
+**Rules:**
+- Allowed functions are mapped to CUDA math builtins (see `ALLOWED_FUNCTIONS`
+  and `ALLOWED_FUNCTIONS_F32` in `kernels/algebra.py`).
+- Up to 8 input rasters (variables `a` through `h`).
+- The expression string is sanitized before embedding in CUDA source.
+- Each unique expression produces a unique kernel cache key via SHA1.
+
+---
+
+## 14. Compile-Time `-D` Defines for Parameterized Kernels
+
+For kernels where parameters affect shared memory layout or loop bounds,
+use NVRTC compile-time defines (`-D`) instead of runtime parameters. This
+enables the compiler to optimize tile sizes and unroll loops.
+
+**Pattern** (see `label.py` NxN morphology dispatch):
+
+```python
+# Structuring element dimensions determine shared memory halo size
+defines = (
+    f"-DSE_RADIUS_X={se_rx}",
+    f"-DSE_RADIUS_Y={se_ry}",
+    f"-DSE_W={se_w}",
+    f"-DSE_H={se_h}",
+    f"-DTILE_W={tile_w}",
+    f"-DTILE_H={tile_h}",
+)
+
+kernels = runtime.compile_kernels(
+    cache_key=cache_key,
+    source=BINARY_ERODE_NXN_KERNEL_SOURCE,
+    kernel_names=("binary_erode_nxn",),
+    options=defines,  # passed to nvrtcCompileProgram
+)
+```
+
+**When to use `-D` defines vs. kernel parameters:**
+- Use `-D` when the value affects `__shared__` array dimensions or loop
+  unroll counts (the compiler needs them at compile time).
+- Use kernel parameters for values that change per-launch but do not
+  affect memory layout (e.g., image width/height, nodata sentinel).
+- Each unique set of defines produces a separate cached compilation.
+
+---
+
+## 15. Separable Pass Decomposition
+
+For rectangular (full-row/column) structuring elements, morphology decomposes
+2D operations into two 1D passes (horizontal then vertical). This reduces
+per-pixel cost from O(W*H) to O(W + H).
+
+**Pattern** (see `label.py` separable morphology, `kernels/morphology.py`
+`BINARY_ERODE_SEP_H/V_KERNEL_SOURCE`):
+
+```python
+# Dispatch checks if the SE is a full rectangle
+if se.all():  # All ones => separable
+    # Horizontal pass: each thread processes one row segment
+    # Vertical pass: each thread processes one column segment
+    _execute_separable_morphology(d_fg, ops, se, width, height, ...)
+else:
+    # General NxN: 2D shared-memory tiled kernel
+    _execute_nxn_morphology(d_fg, ops, se, width, height, ...)
+```
+
+**Kernel design for separable passes:**
+- Each pass uses a 1D shared-memory tile with halo = SE radius.
+- Horizontal kernel: block = (TILE_SIZE, 1, 1), grid covers rows.
+- Vertical kernel: block = (1, TILE_SIZE, 1), grid covers columns.
+- `-DRADIUS` and `-DTILE_SIZE` set via compile-time defines.
+- For compound operations (open = erode + dilate), chain passes
+  without synchronization between same-stream launches.
+
+---
+
+## 16. Ping-Pong Buffer Pattern
+
+Iterative GPU algorithms use two buffer sets and alternate (ping-pong)
+between them each iteration: read from buffer A, write to buffer B,
+then swap. This avoids race conditions without global synchronization.
+
+### Fixed-iteration ping-pong (JFA distance transform)
+
+The Jump Flooding Algorithm runs exactly `log2(N)` iterations. No
+convergence flag is needed. See `kernels/distance.py` and `distance.py`.
+
+```python
+# Allocate two seed buffers (SoA layout for coalesced access)
+d_seed_x_a = cp.empty(n, dtype=np.int32)
+d_seed_y_a = cp.empty(n, dtype=np.int32)
+d_seed_x_b = cp.empty(n, dtype=np.int32)
+d_seed_y_b = cp.empty(n, dtype=np.int32)
+
+cur_sx, cur_sy = d_seed_x_a, d_seed_y_a
+out_sx, out_sy = d_seed_x_b, d_seed_y_b
+
+step_k = N // 2
+while step_k >= 1:
+    # Launch: read from cur, write to out
+    runtime.launch(kernel=jfa_step, ...,
+        params=((cur_sx.data.ptr, cur_sy.data.ptr,
+                 out_sx.data.ptr, out_sy.data.ptr, ...),
+                (KERNEL_PARAM_PTR, ...) ))
+    # Swap (no sync needed -- same stream guarantees ordering)
+    cur_sx, out_sx = out_sx, cur_sx
+    cur_sy, out_sy = out_sy, cur_sy
+    step_k //= 2
+```
+
+### Convergence-driven iteration (hydrology sink fill)
+
+The priority-flood algorithm iterates until no pixel changes. A device-side
+`changed` flag avoids per-iteration D2H of the entire buffer. See
+`kernels/hydrology.py` and `hydrology.py`.
+
+```python
+d_changed = cp.zeros(1, dtype=np.int32)
+
+for iteration in range(max_iterations):
+    d_changed.fill(0)  # Reset flag on device (no D2H)
+    runtime.launch(kernel=propagate, ...,
+        params=((d_elevation.data.ptr, d_fill.data.ptr, ...,
+                 d_changed.data.ptr),
+                (KERNEL_PARAM_PTR, ...) ))
+    # Single scalar D2H to check convergence
+    if int(d_changed.get()) == 0:
+        break
+```
+
+**Rules:**
+- Allocate both buffers once before the loop (no per-iteration allocation).
+- No `synchronize()` between iterations on the same stream.
+- For convergence-driven loops, the only D2H per iteration is the
+  single-int `changed` flag (unavoidable for the host-side break decision).
+
+---
+
+## 17. CCCL `histogram_even` Usage
+
+For binned histograms of device arrays, use `cuda.compute.algorithms.histogram_even`
+instead of custom kernels or `cp.histogram` (which transfers to host).
+
+**Pattern** (see `histogram.py`):
+
+```python
+from cuda.compute import algorithms as cccl_algorithms
+
+# CCCL histogram_even uses half-open intervals [lower, upper).
+# Nudge upper past actual max so the last bin captures it.
+hi_for_cccl = float(np.nextafter(np.float64(hi), np.float64(np.inf)))
+
+# Samples must be float64 for histogram_even
+d_samples = d_valid.astype(cp.float64, copy=False)
+
+# NOTE: histogram_even requires int32 counters (atomicAdd_block limitation).
+d_histogram = cp.zeros(bins, dtype=cp.int32)
+
+cccl_algorithms.histogram_even(
+    d_samples=d_samples,
+    d_histogram=d_histogram,
+    num_output_levels=bins + 1,
+    lower_level=float(lo),
+    upper_level=hi_for_cccl,
+    num_samples=len(d_samples),
+)
+# d_histogram is now on device -- feed directly into CDF via exclusive_sum
+```
+
+**Rules:**
+- Counter array must be `int32` (CCCL limitation). Cast to int64 after
+  if needed for downstream arithmetic.
+- `num_output_levels = bins + 1` (edges, not bin count).
+- Combine with `exclusive_sum` for CDF computation (stays on device).
+- For histogram equalization, build the LUT on device and apply via a
+  custom NVRTC remap kernel (see `kernels/histogram.py`).

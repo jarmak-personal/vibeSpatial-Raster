@@ -66,8 +66,7 @@ def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
         mask_a = a.device_nodata_mask()
         mask_b = b.device_nodata_mask()
         combined_mask = cp.logical_or(mask_a, mask_b)
-        if combined_mask.any():
-            result_device = cp.where(combined_mask, nodata, result_device)
+        result_device = cp.where(combined_mask, nodata, result_device)
 
     # Build result as HOST with device state already populated
     host_data = cp.asnumpy(result_device)
@@ -151,7 +150,7 @@ def raster_apply(
     out_nodata = nodata if nodata is not None else raster.nodata
     if out_nodata is not None and raster.nodata is not None:
         mask = raster.device_nodata_mask()
-        if mask.any():
+        if mask is not None:
             result_device = cp.where(mask, out_nodata, result_device)
 
     host_data = cp.asnumpy(result_device)
@@ -228,7 +227,7 @@ def raster_classify(
     # Preserve nodata
     if raster.nodata is not None:
         mask = raster.device_nodata_mask()
-        if mask.any():
+        if mask is not None:
             result_device = cp.where(mask, raster.nodata, result_device)
 
     host_data = cp.asnumpy(result_device)
@@ -389,13 +388,14 @@ def _raster_expression_gpu(
         d = r.device_data()
         if d.ndim == 3:
             d = d[0]
-        d = d.astype(compute_dtype)
+        d = d.astype(compute_dtype, copy=False)
         _device_refs.append(d)
         input_ptrs.append(d.data.ptr)
 
+        # Pass mask pointer unconditionally when nodata present (avoid mask.any() sync)
         mask = r.device_nodata_mask()
-        if mask is not None and mask.any():
-            m = mask.astype(cp.uint8)
+        if mask is not None:
+            m = mask.astype(cp.uint8, copy=False)
             if m.ndim == 3:
                 m = m[0]
             _device_refs.append(m)
@@ -718,7 +718,7 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
     from vibespatial.raster.kernels.focal import CONVOLVE_NORMALIZED_KERNEL_SOURCE
 
     # Move to device and cast to float64 for computation
-    d_data = _to_device_data(raster).astype(cp.float64)
+    d_data = _to_device_data(raster).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
         d_data = d_data[0]
 
@@ -1001,7 +1001,7 @@ def _gpu_slope_aspect(
     from vibespatial.raster.kernels.focal import SLOPE_ASPECT_KERNEL_SOURCE
 
     # Keep data on device -- no to_numpy() round-trip
-    d_data = _to_device_data(dem).astype(cp.float64)
+    d_data = _to_device_data(dem).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
         d_data = d_data[0]
 
@@ -1329,7 +1329,7 @@ def _hillshade_gpu(
     d_data = dem.device_data()
     # Ensure fp64 for stencil precision (kernel expects double*)
     if d_data.dtype != cp.float64:
-        d_data = d_data.astype(cp.float64)
+        d_data = d_data.astype(cp.float64, copy=False)
     if d_data.ndim == 3:
         d_data = d_data[0]
 
@@ -1546,7 +1546,7 @@ def _terrain_derivative_gpu(
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="terrain derivative requires device-resident data",
     )
-    d_data = dem.device_data().astype(cp.float64)
+    d_data = dem.device_data().astype(cp.float64, copy=False)
     if d_data.ndim == 3:
         d_data = d_data[0]
 
@@ -1893,7 +1893,7 @@ def _focal_stat_gpu(
     t0 = time.monotonic()
 
     # Move to device, cast to float64 for kernel computation
-    d_data = _to_device_data(raster).astype(cp.float64)
+    d_data = _to_device_data(raster).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
         d_data = d_data[0]
 

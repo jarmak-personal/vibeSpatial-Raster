@@ -39,12 +39,13 @@ def _has_cupy() -> bool:
 def _should_use_gpu(raster: OwnedRasterArray) -> bool:
     """Auto-dispatch heuristic: use GPU when available and raster is large enough."""
     try:
-        from vibespatial.runtime import has_gpu_runtime
+        import cupy  # noqa: F401
 
-        if not has_gpu_runtime():
-            return False
-        return raster.pixel_count >= 100_000
-    except Exception:
+        from vibespatial.cuda_runtime import get_cuda_runtime
+
+        runtime = get_cuda_runtime()
+        return runtime.available() and raster.pixel_count >= 100_000
+    except (ImportError, RuntimeError):
         return False
 
 
@@ -214,13 +215,19 @@ def _raster_percentile_cpu(
 # ---------------------------------------------------------------------------
 
 
-def _raster_histogram_gpu(
+def _raster_histogram_gpu_device(
     raster: OwnedRasterArray,
     bins: int = 256,
     range_min: float | None = None,
     range_max: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """GPU path: CCCL histogram_even, all on-device until final transfer."""
+) -> tuple[object, np.ndarray] | None:
+    """GPU path: CCCL histogram_even, returns (d_histogram_cupy, edges_numpy).
+
+    Returns the histogram counts as a CuPy device array (int32) and bin edges
+    as a numpy host array.  Returns None if no valid pixels exist.
+
+    Internal GPU consumers use this to avoid a D->H->D round-trip.
+    """
     import cupy as cp
     from cuda.compute import algorithms as cccl_algorithms
 
@@ -242,10 +249,7 @@ def _raster_histogram_gpu(
 
     n_valid = int(d_valid.size)
     if n_valid == 0:
-        lo = float(range_min if range_min is not None else 0.0)
-        hi = float(range_max if range_max is not None else 1.0)
-        edges = np.linspace(lo, hi, bins + 1)
-        return np.zeros(bins, dtype=np.int64), edges
+        return None
 
     # Determine range on device (single min/max kernel, no host round-trip for data)
     if range_min is not None and range_max is not None:
@@ -286,8 +290,28 @@ def _raster_histogram_gpu(
     # Report the original [lo, hi] range to the caller, not the nudged one
     edges = np.linspace(lo, hi, bins + 1)
 
-    # Single D2H transfer for counts
-    cp.cuda.Stream.null.synchronize()
+    return d_histogram, edges
+
+
+def _raster_histogram_gpu(
+    raster: OwnedRasterArray,
+    bins: int = 256,
+    range_min: float | None = None,
+    range_max: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """GPU path: CCCL histogram_even, all on-device until final transfer."""
+    import cupy as cp
+
+    result = _raster_histogram_gpu_device(raster, bins, range_min, range_max)
+    if result is None:
+        lo = float(range_min if range_min is not None else 0.0)
+        hi = float(range_max if range_max is not None else 1.0)
+        edges = np.linspace(lo, hi, bins + 1)
+        return np.zeros(bins, dtype=np.int64), edges
+
+    d_histogram, edges = result
+
+    # Single D2H transfer for counts (cp.asnumpy syncs implicitly)
     counts = cp.asnumpy(d_histogram).astype(np.int64)
 
     return counts, edges
@@ -501,67 +525,29 @@ def _raster_percentile_gpu(
 ) -> np.ndarray:
     """GPU path: percentile via histogram CDF.
 
-    Uses CCCL histogram_even + exclusive_sum to build the CDF on device,
-    then a single D2H of the CDF array to compute percentile values.
+    Uses _raster_histogram_gpu_device + _raster_cdf_gpu to build the CDF
+    on device, then a single D2H of the CDF array to compute percentile values.
     """
     import cupy as cp
-    from cuda.compute import algorithms as cccl_algorithms
 
-    raster.move_to(
-        Residency.DEVICE,
-        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-        reason="raster_percentile requires device-resident data",
-    )
-    d_data = raster.device_data()
-    d_flat = d_data.ravel()
-
-    # Exclude nodata
-    if raster.nodata is not None:
-        d_nodata_mask = raster.device_nodata_mask().ravel()
-        d_valid_idx = cp.flatnonzero(~d_nodata_mask)
-        d_valid = d_flat[d_valid_idx]
-    else:
-        d_valid = d_flat
-
-    n_valid = int(d_valid.size)
-    if n_valid == 0:
+    result = _raster_histogram_gpu_device(raster, bins, None, None)
+    if result is None:
         return np.full(len(percentiles), np.nan, dtype=np.float64)
 
-    # Get data range on device
-    d_lo = cp.min(d_valid)
-    d_hi = cp.max(d_valid)
-    lo = float(d_lo)
-    hi = float(d_hi)
+    d_hist, edges = result
+
+    lo = float(edges[0])
+    hi = float(edges[-1])
 
     if hi <= lo:
         return np.full(len(percentiles), lo, dtype=np.float64)
 
-    # Histogram via CCCL
-    # CCCL histogram_even uses half-open [lower, upper) so nudge upper past max
-    hi_for_cccl = float(np.nextafter(np.float64(hi), np.float64(np.inf)))
-    d_samples = d_valid.astype(cp.float64, copy=False)
-    # NOTE: CCCL histogram_even requires int32 counters (atomicAdd_block
-    # does not support int64).
-    d_hist = cp.zeros(bins, dtype=cp.int32)
-
-    cccl_algorithms.histogram_even(
-        d_samples=d_samples,
-        d_histogram=d_hist,
-        num_output_levels=bins + 1,
-        lower_level=np.float64(lo),
-        upper_level=np.float64(hi_for_cccl),
-        num_samples=n_valid,
-    )
-
     # CDF via CCCL exclusive_sum (cast to int64 for large rasters)
     d_cdf = _raster_cdf_gpu(d_hist.astype(cp.int64))
 
-    # Transfer CDF to host (small: bins elements)
-    cp.cuda.Stream.null.synchronize()
+    # Transfer CDF to host (small: bins elements; cp.asnumpy syncs implicitly)
     cdf = cp.asnumpy(d_cdf).astype(np.float64)
     total = cdf[-1]
-
-    edges = np.linspace(lo, hi, bins + 1)
 
     results = np.empty(len(percentiles), dtype=np.float64)
     for i, pct in enumerate(percentiles):
@@ -668,8 +654,20 @@ def raster_cumulative_distribution(
 
     t0 = time.perf_counter()
     if use_gpu:
-        counts, edges = _raster_histogram_gpu(raster, bins, range_min, range_max)
-        cdf = np.cumsum(counts)
+        import cupy as cp
+
+        result = _raster_histogram_gpu_device(raster, bins, range_min, range_max)
+        if result is None:
+            lo = float(range_min if range_min is not None else 0.0)
+            hi = float(range_max if range_max is not None else 1.0)
+            edges = np.linspace(lo, hi, bins + 1)
+            cdf = np.zeros(bins, dtype=np.int64)
+        else:
+            d_histogram, edges = result
+            # CDF via CCCL exclusive_sum on device -- no host-side numpy cumsum
+            d_cdf = _raster_cdf_gpu(d_histogram.astype(cp.int64))
+            # Single D2H transfer (cp.asnumpy syncs implicitly)
+            cdf = cp.asnumpy(d_cdf).astype(np.int64)
     else:
         counts, edges = _raster_histogram_cpu(raster, bins, range_min, range_max)
         cdf = _raster_cdf_cpu(counts)

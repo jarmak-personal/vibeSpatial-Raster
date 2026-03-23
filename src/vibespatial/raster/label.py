@@ -777,23 +777,27 @@ def _morphology_nxn_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        data = data[0]
+    # --- Prepare data on device (zero-copy: avoid D→H→D) ---
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+    d_data = raster.device_data()
+    if d_data.ndim == 3:
+        d_data = d_data[0]
 
-    height, width = data.shape
+    height, width = d_data.shape
 
-    # Build binary foreground mask
-    binary = (data != 0).astype(np.uint8)
+    # Build binary foreground mask entirely on device
+    d_binary = (d_data != 0).astype(cp.uint8)
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            binary &= (~np.isnan(data)).astype(np.uint8)
+            d_binary &= (~cp.isnan(d_data)).astype(cp.uint8)
         else:
-            binary &= (data != raster.nodata).astype(np.uint8)
+            d_binary &= (d_data != raster.nodata).astype(cp.uint8)
 
-    # H->D transfer (once)
-    d_input = cp.asarray(np.ascontiguousarray(binary.ravel()))
+    # Already on device — no transfer needed
+    d_input = d_binary.ravel()
 
     se = structuring_element
     se_h, se_w = se.shape
@@ -1232,18 +1236,22 @@ def _sieve_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Move labeled data to device ---
-    data = labeled.to_numpy()
-    if data.ndim == 3:
-        if data.shape[0] != 1:
+    # --- Move labeled data to device (zero-copy: avoid D→H→D) ---
+    labeled.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+    d_data = labeled.device_data()
+    if d_data.ndim == 3:
+        if d_data.shape[0] != 1:
             raise ValueError("sieve_filter requires a single-band raster")
-        data = data[0]
+        d_data = d_data[0]
 
-    height, width = data.shape
+    height, width = d_data.shape
     n = height * width
 
-    # H->D transfer (only transfer at start)
-    d_labels = cp.asarray(np.ascontiguousarray(data.ravel()).astype(np.int32))
+    # Cast to int32 on device (no host round-trip)
+    d_labels = d_data.ravel().astype(cp.int32, copy=False)
 
     # --- Count component sizes entirely on-device using CuPy bincount ---
     # bincount requires non-negative values; labels should be >= 0 for

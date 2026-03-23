@@ -14,7 +14,7 @@ try:
 except ImportError:
     HAS_GPU = False
 
-requires_gpu = pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
+requires_gpu = pytest.mark.gpu
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +231,7 @@ class TestRasterPercentileCPU:
 
 
 @requires_gpu
+@pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 class TestRasterHistogramGPU:
     def test_gpu_matches_cpu(self, raster_float):
         from vibespatial.raster.histogram import raster_histogram
@@ -269,6 +270,7 @@ class TestRasterHistogramGPU:
 
 
 @requires_gpu
+@pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 class TestRasterCDFGPU:
     def test_gpu_monotonic(self, raster_float):
         from vibespatial.raster.histogram import raster_cumulative_distribution
@@ -289,6 +291,7 @@ class TestRasterCDFGPU:
 
 
 @requires_gpu
+@pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 class TestRasterHistogramEqualizeGPU:
     def test_gpu_output_dtype(self, raster_uniform):
         from vibespatial.raster.histogram import raster_histogram_equalize
@@ -326,6 +329,7 @@ class TestRasterHistogramEqualizeGPU:
 
 
 @requires_gpu
+@pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 class TestRasterPercentileGPU:
     def test_gpu_matches_cpu(self, raster_float):
         from vibespatial.raster.histogram import raster_percentile

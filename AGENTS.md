@@ -6,7 +6,7 @@ Guide for AI agents working in this repository.
 
 GPU-first raster processing extension for [vibespatial](https://github.com/jarmak-personal/vibespatial). Installs as `vibespatial.raster` — a namespace package with independent versioning. Python 3.12+, Apache 2.0.
 
-**Core operations:** IO (GeoTIFF/COG), algebra (local + focal), zonal stats, rasterize (vector→raster), connected component labeling, morphology, polygonize (raster→vector).
+**Core operations:** IO (GeoTIFF/COG), algebra (local + focal + fused expressions), terrain analysis (hillshade, slope, aspect, TRI, TPI, curvature), focal statistics (min/max/mean/std/range/variety), zonal stats, rasterize (vector→raster), connected component labeling, morphology (3x3 + NxN + separable + tophat/blackhat + sieve), distance transform (JFA), histogram/CDF/equalization/percentile, hydrology (sink filling), resampling (nearest/bilinear/bicubic), polygonize (raster→vector).
 
 ## Hard Constraints
 
@@ -26,19 +26,32 @@ src/vibespatial/raster/
 ├── io.py                # Read/write via rasterio (HYBRID path)
 ├── nvimgcodec_io.py     # GPU-native decode via nvImageCodec
 ├── geokeys.py           # GeoTIFF GeoKey parsing
-├── algebra.py           # Local (add/sub/mul/div/apply/where/classify) + focal (convolve, gaussian, slope, aspect)
+├── algebra.py           # Local (add/sub/mul/div/apply/where/classify/expression), focal (convolve, gaussian),
+│                        #   terrain (slope, aspect, hillshade, TRI, TPI, curvature),
+│                        #   focal stats (min/max/mean/std/range/variety)
 ├── zonal.py             # Zonal statistics via CCCL segmented reduce
 ├── rasterize.py         # Vector-to-raster via NVRTC point-in-polygon kernel
-├── label.py             # Connected components (union-find) + morphology (erode/dilate/open/close/sieve)
+├── label.py             # Connected components (union-find) + morphology (erode/dilate/open/close/sieve,
+│                        #   NxN structuring elements, separable SE decomposition, tophat/blackhat)
 ├── polygonize.py        # Raster-to-vector via marching-squares
+├── distance.py          # Euclidean distance transform via Jump Flooding Algorithm (JFA)
+├── histogram.py         # Histogram, CDF, equalization, percentile via CCCL histogram_even
+├── hydrology.py         # DEM sink/depression filling (iterative priority-flood)
+├── resample.py          # Raster resampling/warping (nearest, bilinear, bicubic)
 └── kernels/             # Raw NVRTC kernel source strings (NOT .cu files — Python strings)
+    ├── algebra.py       # Fused expression kernel (runtime-compiled from user expression)
     ├── ccl.py           # Union-find init/merge/pointer-jump/relabel
-    ├── focal.py         # 2D convolution with shared-memory tiling
-    ├── morphology.py    # Binary erode/dilate with halo
-    └── polygonize.py    # Marching-squares classify + emit
+    ├── distance.py      # JFA init/step/distance-compute (ping-pong buffers)
+    ├── focal.py         # 2D convolution, slope/aspect, hillshade, terrain derivatives, focal stats
+    ├── histogram.py     # Histogram equalization remap kernel
+    ├── hydrology.py     # Sink-fill init/propagate (dtype-templated, iterative convergence)
+    ├── morphology.py    # Binary erode/dilate: 3x3, NxN (compile-time -D defines), separable 1D passes
+    ├── polygonize.py    # Marching-squares classify + emit
+    └── resample.py      # Nearest/bilinear/bicubic resampling (dtype-templated)
 
-tests/                   # 8 test files (~2,300 lines), one per module
+tests/                   # 19 test files (~6,900 lines)
 scripts/
+├── bench.py             # Benchmarking script for raster operations
 └── check_zero_copy.py   # Zero-copy compliance linter (ZCOPY001-003)
 docs/                    # Sphinx + MyST documentation (user/ and dev/ guides)
 .claude/

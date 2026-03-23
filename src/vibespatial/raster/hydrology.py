@@ -22,6 +22,7 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticKind,
     from_numpy,
 )
+from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -222,16 +223,25 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("sink fill requires a single-band raster")
-        data = data[0]
+    # --- Validate band count before any transfer ---
+    if raster.band_count != 1:
+        raise ValueError("sink fill requires a single-band raster")
 
-    height, width = data.shape
+    height, width = raster.height, raster.width
 
-    # Determine CUDA dtype
+    # --- Move data to device (zero-copy: no D->H->D ping-pong) ---
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="fill_sinks_gpu requires device-resident data",
+    )
+    d_data = raster.device_data()
+
+    # Squeeze band dimension if 3D -> 2D view
+    if d_data.ndim == 3:
+        d_data = d_data[0]
+
+    # Determine working dtype for CUDA kernel
     if raster.dtype in (np.dtype("float32"), np.dtype("float64")):
         work_dtype = raster.dtype
     else:
@@ -239,24 +249,20 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
         work_dtype = np.dtype("float32")
 
     cuda_dtype = _numpy_dtype_to_cuda(work_dtype)
-    elev_host = data.astype(work_dtype)
 
-    # Build nodata mask on host
-    nodata_mask_host = np.zeros((height, width), dtype=np.uint8)
+    # Cast to working dtype on device (copy=False avoids allocation when already matching)
+    d_elevation = d_data.astype(work_dtype, copy=False).ravel()
+    d_fill = cp.empty_like(d_elevation)
+
+    # Build nodata mask entirely on device
+    d_nodata_mask = None
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            nodata_mask_host = np.isnan(data).astype(np.uint8)
+            d_nodata_mask = cp.isnan(d_data).astype(cp.uint8).ravel()
         else:
-            nodata_mask_host = (data == raster.nodata).astype(np.uint8)
+            d_nodata_mask = (d_data == raster.nodata).astype(cp.uint8).ravel()
+        # Always pass the mask — kernel handles per-pixel nodata check via nullptr
 
-    has_nodata = nodata_mask_host.any()
-
-    # H->D transfer (only transfer at start)
-    d_elevation = cp.asarray(np.ascontiguousarray(elev_host.ravel()))
-    d_fill = cp.empty_like(d_elevation)
-    d_nodata_mask = (
-        cp.asarray(np.ascontiguousarray(nodata_mask_host.ravel())) if has_nodata else None
-    )
     d_changed = cp.zeros(1, dtype=np.int32)
 
     # Device pointer for nodata mask (0 if no nodata)
@@ -300,51 +306,57 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
         ),
     )
 
-    # --- Phase 2: Iterative propagation until convergence ---
+    # --- Phase 2: Iterative propagation with batched convergence checks ---
+    # Amortize D->H sync cost by checking convergence every BATCH_SIZE iterations.
+    # The kernel only writes changed=1 (never resets), so changes accumulate
+    # across the batch. We reset d_changed only at batch boundaries.
+    CONVERGENCE_BATCH_SIZE = 32
     max_iterations = max(height + width, 1000)
     iterations = 0
-    for iterations in range(1, max_iterations + 1):
-        d_changed.fill(0)
 
+    prop_params = (
+        (
+            d_elevation.data.ptr,
+            d_fill.data.ptr,
+            nodata_ptr,
+            width,
+            height,
+            d_changed.data.ptr,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        ),
+    )
+
+    d_changed.fill(0)
+    for iterations in range(1, max_iterations + 1):
         runtime.launch(
             kernel=prop_kernels["fill_propagate"],
             grid=grid_2d,
             block=block_2d,
-            params=(
-                (
-                    d_elevation.data.ptr,
-                    d_fill.data.ptr,
-                    nodata_ptr,
-                    width,
-                    height,
-                    d_changed.data.ptr,
-                ),
-                (
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                    KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR,
-                ),
-            ),
+            params=prop_params,
         )
 
-        # Check convergence — single scalar D2H (legitimate convergence check)
-        if int(d_changed.item()) == 0:
-            break
+        # Check convergence only at batch boundaries
+        if iterations % CONVERGENCE_BATCH_SIZE == 0:
+            if int(d_changed.item()) == 0:
+                break
+            d_changed.fill(0)
 
     # --- Restore nodata in fill array ---
-    if has_nodata and d_nodata_mask is not None:
+    if d_nodata_mask is not None:
         # Use CuPy vectorized op to restore nodata values on device
-        d_fill_2d = d_fill.reshape(height, width)
-        d_nodata_2d = d_nodata_mask.reshape(height, width)
+        d_nodata_bool = d_nodata_mask.astype(bool)
         if raster.nodata is not None and np.isnan(raster.nodata):
-            d_fill_2d[d_nodata_2d.astype(bool)] = cp.nan
+            d_fill[d_nodata_bool] = cp.nan
         elif raster.nodata is not None:
             nodata_val = work_dtype.type(raster.nodata)
-            d_fill_2d[d_nodata_2d.astype(bool)] = nodata_val
-        d_fill = d_fill_2d.ravel()
+            d_fill[d_nodata_bool] = nodata_val
 
     # --- D->H transfer (final) ---
     host_fill = cp.asnumpy(d_fill).reshape(height, width)
