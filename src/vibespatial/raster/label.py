@@ -49,6 +49,105 @@ def _has_cupy() -> bool:
         return False
 
 
+def make_structuring_element(
+    shape: str,
+    size: int | tuple[int, int],
+) -> np.ndarray:
+    """Build a binary structuring element (SE) for morphological operations.
+
+    Parameters
+    ----------
+    shape : str
+        One of ``'rect'``, ``'cross'``, ``'disk'``.
+    size : int or (int, int)
+        For ``'rect'`` and ``'cross'``: side length (int) or (height, width).
+        For ``'disk'``: radius as int (the SE will be ``(2*r+1, 2*r+1)``).
+        Sizes must be odd.
+
+    Returns
+    -------
+    np.ndarray
+        2-D uint8 array with 1s for active SE positions.
+
+    Raises
+    ------
+    ValueError
+        If *shape* is unknown or *size* is even.
+    """
+    if isinstance(size, int):
+        h = w = size
+    else:
+        h, w = size
+
+    valid_shapes = ("rect", "cross", "disk")
+    if shape not in valid_shapes:
+        raise ValueError(f"shape must be one of {list(valid_shapes)}, got {shape!r}")
+
+    if shape == "disk":
+        if isinstance(size, tuple):
+            raise ValueError("disk shape requires a single integer radius, not (h, w)")
+        radius = size
+        d = 2 * radius + 1
+        se = np.zeros((d, d), dtype=np.uint8)
+        cy = cx = radius
+        for y in range(d):
+            for x in range(d):
+                if (y - cy) ** 2 + (x - cx) ** 2 <= radius * radius:
+                    se[y, x] = 1
+        return se
+
+    # rect and cross require odd dimensions
+    if h % 2 == 0 or w % 2 == 0:
+        raise ValueError(f"structuring element dimensions must be odd, got ({h}, {w})")
+
+    if shape == "rect":
+        return np.ones((h, w), dtype=np.uint8)
+
+    # cross: only center row and center column are active
+    se = np.zeros((h, w), dtype=np.uint8)
+    se[h // 2, :] = 1
+    se[:, w // 2] = 1
+    return se
+
+
+def _resolve_structuring_element(
+    structuring_element: np.ndarray | str | None,
+    connectivity: int,
+) -> np.ndarray:
+    """Resolve an SE specification to a concrete numpy array.
+
+    If *structuring_element* is None, fall back to the legacy 3x3 SE
+    determined by *connectivity*.
+    """
+    if structuring_element is None:
+        return _structure_for_connectivity(connectivity).astype(np.uint8)
+
+    if isinstance(structuring_element, str):
+        # Preset strings: 'rect3', 'cross5', 'disk2', etc. are NOT supported
+        # here — callers should use make_structuring_element() explicitly.
+        raise TypeError(
+            "structuring_element must be a numpy array or None. "
+            "Use make_structuring_element() to build presets."
+        )
+
+    se = np.asarray(structuring_element, dtype=np.uint8)
+    if se.ndim != 2:
+        raise ValueError(f"structuring element must be 2-D, got {se.ndim}-D")
+    if se.shape[0] % 2 == 0 or se.shape[1] % 2 == 0:
+        raise ValueError(f"structuring element dimensions must be odd, got {se.shape}")
+    return se
+
+
+def _is_full_rect(se: np.ndarray) -> bool:
+    """Return True if *se* is a full rectangular SE (all ones) — separable."""
+    return bool(se.all())
+
+
+def _se_is_default_3x3(se: np.ndarray) -> bool:
+    """Return True if *se* is a 3x3 element matching the legacy kernels."""
+    return se.shape == (3, 3)
+
+
 def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 100_000) -> bool:
     """Auto-dispatch heuristic: use GPU when available and image is large enough."""
     try:
@@ -635,6 +734,365 @@ def morphology_gpu(
 
 
 # ---------------------------------------------------------------------------
+# GPU: NxN morphology with arbitrary structuring elements
+# ---------------------------------------------------------------------------
+
+
+def _morphology_nxn_gpu(
+    raster: OwnedRasterArray,
+    operation: str,
+    *,
+    structuring_element: np.ndarray,
+    iterations: int = 1,
+) -> OwnedRasterArray:
+    """GPU binary morphology with arbitrary NxN structuring elements.
+
+    Dispatches to separable 1-D passes for full-rectangle SEs (O(N) per pixel)
+    or to the general NxN 2-D kernel otherwise.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input binary raster (nonzero = foreground).
+    operation : str
+        One of "erode", "dilate", "open", "close".
+    structuring_element : np.ndarray
+        2-D uint8 array with odd dimensions.
+    iterations : int
+        Number of times to apply the operation.
+
+    Returns
+    -------
+    OwnedRasterArray
+        HOST-resident result raster.
+    """
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import get_cuda_runtime
+
+    valid_ops = ("erode", "dilate", "open", "close")
+    if operation not in valid_ops:
+        raise ValueError(f"operation must be one of {list(valid_ops)}, got {operation!r}")
+
+    t0 = time.perf_counter()
+    runtime = get_cuda_runtime()
+
+    # --- Prepare data on device ---
+    data = raster.to_numpy()
+    if data.ndim == 3:
+        data = data[0]
+
+    height, width = data.shape
+
+    # Build binary foreground mask
+    binary = (data != 0).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            binary &= (~np.isnan(data)).astype(np.uint8)
+        else:
+            binary &= (data != raster.nodata).astype(np.uint8)
+
+    # H->D transfer (once)
+    d_input = cp.asarray(np.ascontiguousarray(binary.ravel()))
+
+    se = structuring_element
+    se_h, se_w = se.shape
+    n = height * width
+    d_output = cp.empty(n, dtype=np.uint8)
+
+    use_separable = _is_full_rect(se) and se_h == se_w
+
+    # Determine operation sequence
+    if operation == "erode":
+        ops_sequence = ["erode"] * iterations
+    elif operation == "dilate":
+        ops_sequence = ["dilate"] * iterations
+    elif operation == "open":
+        ops_sequence = (["erode"] * iterations) + (["dilate"] * iterations)
+    elif operation == "close":
+        ops_sequence = (["dilate"] * iterations) + (["erode"] * iterations)
+    else:
+        raise ValueError(f"Unknown operation: {operation!r}")
+
+    if use_separable:
+        # --- Separable path: two 1-D passes per operation ---
+        _run_separable_morph(runtime, d_input, d_output, width, height, n, se, ops_sequence)
+        # After _run_separable_morph, result is in d_input (ping-pong ended there)
+        d_result = d_input
+    else:
+        # --- General NxN 2-D kernel ---
+        d_result = _run_nxn_morph(runtime, d_input, d_output, width, height, n, se, ops_sequence)
+
+    # --- D->H transfer ---
+    host_result = cp.asnumpy(d_result).reshape(height, width)
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(
+        host_result.astype(np.uint8),
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    se_desc = f"{se_h}x{se_w}" + (" separable" if use_separable else "")
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"morphology_nxn_gpu op={operation} se={se_desc} iterations={iterations} pixels={n}"
+            ),
+            residency=result.residency,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
+        )
+    )
+    logger.debug(
+        "morphology_nxn_gpu op=%s se=%s iter=%d pixels=%d elapsed=%.4fs",
+        operation,
+        se_desc,
+        iterations,
+        n,
+        elapsed,
+    )
+    return result
+
+
+def _run_nxn_morph(
+    runtime: object,
+    d_input: object,
+    d_output: object,
+    width: int,
+    height: int,
+    n: int,
+    se: np.ndarray,
+    ops_sequence: list[str],
+) -> object:
+    """Execute NxN 2-D morphology kernels for each operation in the sequence.
+
+    Returns the device buffer holding the final result.
+    """
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.morphology import (
+        BINARY_DILATE_NXN_KERNEL_SOURCE,
+        BINARY_ERODE_NXN_KERNEL_SOURCE,
+    )
+
+    se_h, se_w = se.shape
+    se_ry = se_h // 2
+    se_rx = se_w // 2
+
+    # Choose tile size: shrink tiles when halo is large to keep smem reasonable
+    tile_w = 16
+    tile_h = 16
+    smem_bytes = (tile_h + 2 * se_ry) * (tile_w + 2 * se_rx + 1)
+    # Cap shared memory at 48 KB (conservative; most GPUs have >=48 KB)
+    while smem_bytes > 48 * 1024 and tile_w > 4:
+        tile_w = max(4, tile_w // 2)
+        tile_h = max(4, tile_h // 2)
+        smem_bytes = (tile_h + 2 * se_ry) * (tile_w + 2 * se_rx + 1)
+
+    defines = (
+        f"-DSE_RADIUS_X={se_rx}",
+        f"-DSE_RADIUS_Y={se_ry}",
+        f"-DSE_W={se_w}",
+        f"-DSE_H={se_h}",
+        f"-DTILE_W={tile_w}",
+        f"-DTILE_H={tile_h}",
+    )
+
+    # Compile NxN erode kernel
+    erode_key = make_kernel_cache_key(
+        f"binary_erode_nxn_{se_h}x{se_w}_t{tile_h}x{tile_w}",
+        BINARY_ERODE_NXN_KERNEL_SOURCE,
+    )
+    erode_kernels = runtime.compile_kernels(
+        cache_key=erode_key,
+        source=BINARY_ERODE_NXN_KERNEL_SOURCE,
+        kernel_names=("binary_erode_nxn",),
+        options=defines,
+    )
+
+    # Compile NxN dilate kernel
+    dilate_key = make_kernel_cache_key(
+        f"binary_dilate_nxn_{se_h}x{se_w}_t{tile_h}x{tile_w}",
+        BINARY_DILATE_NXN_KERNEL_SOURCE,
+    )
+    dilate_kernels = runtime.compile_kernels(
+        cache_key=dilate_key,
+        source=BINARY_DILATE_NXN_KERNEL_SOURCE,
+        kernel_names=("binary_dilate_nxn",),
+        options=defines,
+    )
+
+    # Transfer SE to device (once)
+    d_se = cp.asarray(np.ascontiguousarray(se.ravel().astype(np.uint8)))
+
+    block_2d = (tile_w, tile_h, 1)
+    grid_2d = (
+        (width + tile_w - 1) // tile_w,
+        (height + tile_h - 1) // tile_h,
+        1,
+    )
+
+    param_types = (
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+    )
+
+    current_in = d_input
+    current_out = d_output
+    for op in ops_sequence:
+        kernel = (
+            erode_kernels["binary_erode_nxn"]
+            if op == "erode"
+            else dilate_kernels["binary_dilate_nxn"]
+        )
+        runtime.launch(
+            kernel=kernel,
+            grid=grid_2d,
+            block=block_2d,
+            params=(
+                (current_in.data.ptr, current_out.data.ptr, d_se.data.ptr, width, height),
+                param_types,
+            ),
+        )
+        current_in, current_out = current_out, current_in
+
+    return current_in
+
+
+def _run_separable_morph(
+    runtime: object,
+    d_input: object,
+    d_output: object,
+    width: int,
+    height: int,
+    n: int,
+    se: np.ndarray,
+    ops_sequence: list[str],
+) -> None:
+    """Execute separable 1-D morphology passes (horizontal then vertical).
+
+    Modifies d_input/d_output in-place via ping-pong. After return the final
+    result is in d_input (due to an even number of swaps per operation: H then V).
+    """
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.morphology import (
+        BINARY_DILATE_SEP_H_KERNEL_SOURCE,
+        BINARY_DILATE_SEP_V_KERNEL_SOURCE,
+        BINARY_ERODE_SEP_H_KERNEL_SOURCE,
+        BINARY_ERODE_SEP_V_KERNEL_SOURCE,
+    )
+
+    se_h, se_w = se.shape
+    radius_y = se_h // 2
+    radius_x = se_w // 2
+
+    tile_size = 256  # 1-D tile for separable passes
+
+    h_defines = (f"-DRADIUS={radius_x}", f"-DTILE_SIZE={tile_size}")
+    v_defines = (f"-DRADIUS={radius_y}", f"-DTILE_SIZE={tile_size}")
+
+    # Compile separable kernels
+    erode_h_key = make_kernel_cache_key(
+        f"binary_erode_sep_h_r{radius_x}_t{tile_size}",
+        BINARY_ERODE_SEP_H_KERNEL_SOURCE,
+    )
+    erode_h_kernels = runtime.compile_kernels(
+        cache_key=erode_h_key,
+        source=BINARY_ERODE_SEP_H_KERNEL_SOURCE,
+        kernel_names=("binary_erode_sep_h",),
+        options=h_defines,
+    )
+
+    erode_v_key = make_kernel_cache_key(
+        f"binary_erode_sep_v_r{radius_y}_t{tile_size}",
+        BINARY_ERODE_SEP_V_KERNEL_SOURCE,
+    )
+    erode_v_kernels = runtime.compile_kernels(
+        cache_key=erode_v_key,
+        source=BINARY_ERODE_SEP_V_KERNEL_SOURCE,
+        kernel_names=("binary_erode_sep_v",),
+        options=v_defines,
+    )
+
+    dilate_h_key = make_kernel_cache_key(
+        f"binary_dilate_sep_h_r{radius_x}_t{tile_size}",
+        BINARY_DILATE_SEP_H_KERNEL_SOURCE,
+    )
+    dilate_h_kernels = runtime.compile_kernels(
+        cache_key=dilate_h_key,
+        source=BINARY_DILATE_SEP_H_KERNEL_SOURCE,
+        kernel_names=("binary_dilate_sep_h",),
+        options=h_defines,
+    )
+
+    dilate_v_key = make_kernel_cache_key(
+        f"binary_dilate_sep_v_r{radius_y}_t{tile_size}",
+        BINARY_DILATE_SEP_V_KERNEL_SOURCE,
+    )
+    dilate_v_kernels = runtime.compile_kernels(
+        cache_key=dilate_v_key,
+        source=BINARY_DILATE_SEP_V_KERNEL_SOURCE,
+        kernel_names=("binary_dilate_sep_v",),
+        options=v_defines,
+    )
+
+    # Grid configs for H and V passes
+    grid_h = ((width + tile_size - 1) // tile_size, height, 1)
+    block_h = (tile_size, 1, 1)
+
+    grid_v = (width, (height + tile_size - 1) // tile_size, 1)
+    block_v = (tile_size, 1, 1)
+
+    param_types = (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32)
+
+    current_in = d_input
+    current_out = d_output
+    for op in ops_sequence:
+        # Horizontal pass: current_in -> current_out
+        if op == "erode":
+            kernel_h = erode_h_kernels["binary_erode_sep_h"]
+            kernel_v = erode_v_kernels["binary_erode_sep_v"]
+        else:
+            kernel_h = dilate_h_kernels["binary_dilate_sep_h"]
+            kernel_v = dilate_v_kernels["binary_dilate_sep_v"]
+
+        runtime.launch(
+            kernel=kernel_h,
+            grid=grid_h,
+            block=block_h,
+            params=(
+                (current_in.data.ptr, current_out.data.ptr, width, height),
+                param_types,
+            ),
+        )
+        # Vertical pass: current_out -> current_in (ping-pong back)
+        runtime.launch(
+            kernel=kernel_v,
+            grid=grid_v,
+            block=block_v,
+            params=(
+                (current_out.data.ptr, current_in.data.ptr, width, height),
+                param_types,
+            ),
+        )
+    # After each op: H swaps in->out, V swaps out->in. Result is in current_in.
+
+
+# ---------------------------------------------------------------------------
 # Public API: dispatchers (GPU/CPU auto-selection)
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1350,7 @@ def raster_morphology(
     *,
     connectivity: int = 4,
     iterations: int = 1,
+    structuring_element: np.ndarray | None = None,
     use_gpu: bool | None = None,
 ) -> OwnedRasterArray:
     """Apply binary morphological operation to a raster.
@@ -904,8 +1363,13 @@ def raster_morphology(
         One of "erode", "dilate", "open", "close".
     connectivity : int
         4 or 8 neighbor connectivity for the structuring element.
+        Ignored when *structuring_element* is provided.
     iterations : int
         Number of times to apply the operation.
+    structuring_element : np.ndarray or None
+        Custom structuring element (2-D uint8 array with odd dimensions).
+        If None, falls back to the legacy 3x3 SE based on *connectivity*.
+        Use :func:`make_structuring_element` to build presets.
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
 
@@ -918,13 +1382,26 @@ def raster_morphology(
     if operation not in valid_ops:
         raise ValueError(f"operation must be one of {list(valid_ops)}, got {operation!r}")
 
+    se = _resolve_structuring_element(structuring_element, connectivity)
+
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
     if use_gpu:
-        return morphology_gpu(raster, operation, connectivity=connectivity, iterations=iterations)
+        # Use legacy 3x3 fast path when SE matches
+        if _se_is_default_3x3(se):
+            return morphology_gpu(
+                raster, operation, connectivity=connectivity, iterations=iterations
+            )
+        return _morphology_nxn_gpu(raster, operation, structuring_element=se, iterations=iterations)
     else:
-        return _morphology_cpu(raster, operation, connectivity=connectivity, iterations=iterations)
+        return _morphology_cpu(
+            raster,
+            operation,
+            connectivity=connectivity,
+            iterations=iterations,
+            structuring_element=se,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +1415,7 @@ def _morphology_cpu(
     *,
     connectivity: int = 4,
     iterations: int = 1,
+    structuring_element: np.ndarray | None = None,
 ) -> OwnedRasterArray:
     """CPU binary morphology via scipy.ndimage."""
     from scipy.ndimage import binary_closing, binary_dilation, binary_erosion, binary_opening
@@ -960,9 +1438,13 @@ def _morphology_cpu(
         else:
             binary &= data != raster.nodata
 
-    structure = _structure_for_connectivity(connectivity)
+    if structuring_element is not None:
+        structure = structuring_element
+    else:
+        structure = _structure_for_connectivity(connectivity)
     result_data = ops[operation](binary, structure=structure, iterations=iterations)
 
+    se_desc = f"{structure.shape[0]}x{structure.shape[1]}"
     result = from_numpy(
         result_data.astype(raster.dtype),
         nodata=raster.nodata,
@@ -972,7 +1454,147 @@ def _morphology_cpu(
     result.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"morphology_cpu op={operation} connectivity={connectivity} iterations={iterations}",
+            detail=(
+                f"morphology_cpu op={operation} se={se_desc} "
+                f"connectivity={connectivity} iterations={iterations}"
+            ),
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def raster_morphology_tophat(
+    raster: OwnedRasterArray,
+    structuring_element: np.ndarray | None = None,
+    *,
+    connectivity: int = 4,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """White top-hat transform: original minus morphological opening.
+
+    Extracts bright features smaller than the structuring element.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input binary raster (nonzero = foreground).
+    structuring_element : np.ndarray or None
+        Custom SE (2-D uint8, odd dimensions). Defaults to 3x3 from connectivity.
+    connectivity : int
+        4 or 8 (used only if *structuring_element* is None).
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-dispatch (None).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Pixels that were removed by opening (bright detail).
+    """
+    opened = raster_morphology(
+        raster,
+        "open",
+        connectivity=connectivity,
+        structuring_element=structuring_element,
+        use_gpu=use_gpu,
+    )
+    # Top-hat = original - opened (binary: foreground in original but not in opened)
+    original_data = raster.to_numpy()
+    if original_data.ndim == 3:
+        original_data = original_data[0]
+    opened_data = opened.to_numpy()
+    if opened_data.ndim == 3:
+        opened_data = opened_data[0]
+
+    # Binary: original foreground minus opened foreground
+    orig_bin = (original_data != 0).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
+        else:
+            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
+
+    opened_bin = (opened_data != 0).astype(np.uint8)
+    tophat_data = (orig_bin & ~opened_bin).astype(np.uint8)
+
+    result = from_numpy(
+        tophat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail="morphology_tophat (original - opening)",
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def raster_morphology_blackhat(
+    raster: OwnedRasterArray,
+    structuring_element: np.ndarray | None = None,
+    *,
+    connectivity: int = 4,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Black top-hat transform: morphological closing minus original.
+
+    Extracts dark features (holes) smaller than the structuring element.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input binary raster (nonzero = foreground).
+    structuring_element : np.ndarray or None
+        Custom SE (2-D uint8, odd dimensions). Defaults to 3x3 from connectivity.
+    connectivity : int
+        4 or 8 (used only if *structuring_element* is None).
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-dispatch (None).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Pixels that were added by closing (dark detail / holes filled).
+    """
+    closed = raster_morphology(
+        raster,
+        "close",
+        connectivity=connectivity,
+        structuring_element=structuring_element,
+        use_gpu=use_gpu,
+    )
+    # Black-hat = closed - original
+    original_data = raster.to_numpy()
+    if original_data.ndim == 3:
+        original_data = original_data[0]
+    closed_data = closed.to_numpy()
+    if closed_data.ndim == 3:
+        closed_data = closed_data[0]
+
+    orig_bin = (original_data != 0).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
+        else:
+            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
+
+    closed_bin = (closed_data != 0).astype(np.uint8)
+    blackhat_data = (closed_bin & ~orig_bin).astype(np.uint8)
+
+    result = from_numpy(
+        blackhat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail="morphology_blackhat (closing - original)",
             residency=result.residency,
         )
     )
