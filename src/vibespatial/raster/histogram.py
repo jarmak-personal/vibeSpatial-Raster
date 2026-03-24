@@ -138,11 +138,11 @@ def _raster_histogram_equalize_cpu(
         valid = flat
 
     if valid.size == 0:
-        # Use the same out_nodata logic as the main return path:
-        # only preserve nodata for uint8 inputs (NaN cannot be represented in uint8).
-        early_nodata = (
-            int(raster.nodata) if raster.nodata is not None and data.dtype == np.uint8 else None
-        )
+        # Use the same out_nodata logic as the main return path.
+        if raster.nodata is not None:
+            early_nodata = int(raster.nodata) if data.dtype == np.uint8 else 0
+        else:
+            early_nodata = None
         return from_numpy(
             np.zeros(original_shape, dtype=np.uint8),
             nodata=early_nodata,
@@ -155,12 +155,17 @@ def _raster_histogram_equalize_cpu(
     cdf_min = cdf[cdf > 0].min() if np.any(cdf > 0) else 0
     total_valid = int(valid.size)
 
-    # Build LUT
+    # Build LUT.  When the output nodata sentinel is 0 (non-uint8 input with
+    # nodata), map valid pixels to [1, 255] so no valid pixel collides with the
+    # nodata sentinel.
+    reserves_zero = raster.nodata is not None and data.dtype != np.uint8
+    lut_lo = 1 if reserves_zero else 0
+    lut_range = 255 - lut_lo  # 254 when reserving 0, else 255
     lut = np.zeros(256, dtype=np.uint8)
     denom = total_valid - cdf_min
     if denom > 0:
         for i in range(256):
-            lut[i] = np.clip(round((cdf[i] - cdf_min) / denom * 255.0), 0, 255)
+            lut[i] = np.clip(round((cdf[i] - cdf_min) / denom * lut_range + lut_lo), lut_lo, 255)
 
     # Apply LUT
     result = lut[flat].reshape(original_shape)
@@ -171,9 +176,14 @@ def _raster_histogram_equalize_cpu(
         result_flat[nodata_mask] = nodata_u8
         result = result_flat.reshape(original_shape)
 
-    out_nodata = (
-        int(raster.nodata) if raster.nodata is not None and data.dtype == np.uint8 else None
-    )
+    # Determine output nodata sentinel.  The output is always uint8.
+    # - uint8 input: preserve original nodata sentinel (already an int in [0, 255])
+    # - non-uint8 input with nodata: nodata pixels were mapped to 0, declare nodata=0
+    # - no nodata: None
+    if raster.nodata is not None:
+        out_nodata = int(raster.nodata) if data.dtype == np.uint8 else 0
+    else:
+        out_nodata = None
     return from_numpy(result, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
 
 
@@ -389,8 +399,10 @@ def _raster_histogram_equalize_gpu(
             d_valid_idx = cp.flatnonzero(d_valid_mask.ravel())
             if d_valid_idx.size == 0:
                 host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
+                # Output is uint8; non-uint8 nodata mapped to 0
+                early_nodata = 0 if raster.nodata is not None else None
                 return from_numpy(
-                    host_result, nodata=raster.nodata, affine=raster.affine, crs=raster.crs
+                    host_result, nodata=early_nodata, affine=raster.affine, crs=raster.crs
                 )
             d_valid = d_flat[d_valid_idx]
             d_min = cp.min(d_valid)
@@ -429,7 +441,12 @@ def _raster_histogram_equalize_gpu(
     n_valid = int(d_valid_u8.size)
     if n_valid == 0:
         host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
-        return from_numpy(host_result, nodata=raster.nodata, affine=raster.affine, crs=raster.crs)
+        # Output is uint8; for non-uint8 inputs, nodata pixels are at 0
+        if raster.nodata is not None:
+            early_nodata = int(raster.nodata) if raster.dtype == np.uint8 else 0
+        else:
+            early_nodata = None
+        return from_numpy(host_result, nodata=early_nodata, affine=raster.affine, crs=raster.crs)
 
     d_samples_i32 = d_valid_u8.astype(cp.int32)
     # NOTE: CCCL histogram_even requires int32 counters (atomicAdd_block
@@ -450,8 +467,14 @@ def _raster_histogram_equalize_gpu(
     d_cdf = _raster_cdf_gpu(d_hist.astype(cp.int64))
 
     # Step 3: Build LUT on device from CDF
-    # equalized[i] = round((cdf[i] - cdf_min) / (n_valid - cdf_min) * 255)
+    # equalized[i] = round((cdf[i] - cdf_min) / (n_valid - cdf_min) * range + lo)
     # cdf_min = first nonzero CDF value
+    # When nodata sentinel is 0 (non-uint8 input with nodata), reserve 0 for
+    # nodata by mapping valid pixels to [1, 255].
+    reserves_zero = raster.nodata is not None and raster.dtype != np.uint8
+    lut_lo = 1 if reserves_zero else 0
+    lut_range = 255 - lut_lo  # 254 when reserving 0, else 255
+
     d_nonzero_mask = d_cdf > 0
     d_nonzero_indices = cp.flatnonzero(d_nonzero_mask)
     if d_nonzero_indices.size > 0:
@@ -467,9 +490,10 @@ def _raster_histogram_equalize_gpu(
         cp.around(
             (d_cdf.astype(cp.float64) - d_cdf_min.astype(cp.float64))
             / d_denom.astype(cp.float64)
-            * 255.0
+            * float(lut_range)
+            + float(lut_lo)
         ),
-        0,
+        lut_lo,
         255,
     ).astype(cp.uint8)
 
@@ -517,9 +541,14 @@ def _raster_histogram_equalize_gpu(
 
     # Single D2H transfer at the end
     host_result = cp.asnumpy(d_result)
-    out_nodata = (
-        int(raster.nodata) if raster.nodata is not None and raster.dtype == np.uint8 else None
-    )
+    # Determine output nodata sentinel.  The output is always uint8.
+    # - uint8 input: preserve original nodata sentinel
+    # - non-uint8 input with nodata: nodata pixels were mapped to 0, declare nodata=0
+    # - no nodata: None
+    if raster.nodata is not None:
+        out_nodata = int(raster.nodata) if raster.dtype == np.uint8 else 0
+    else:
+        out_nodata = None
     return from_numpy(host_result, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
 
 

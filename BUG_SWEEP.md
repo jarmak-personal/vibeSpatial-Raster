@@ -41,7 +41,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/histogram.py:109-123`
   - `data[data != raster.nodata]` when `nodata=NaN` includes all NaN values (since `NaN != NaN` is True). NaN values corrupt the normalization range.
 
-- [ ] **8. Histogram equalize: nodata information loss for non-uint8**
+- [x] **8. Histogram equalize: nodata information loss for non-uint8**
   - `src/vibespatial/raster/histogram.py:132,170`
   - Non-uint8 rasters with nodata: equalized output maps nodata pixels to 0 but declares `nodata=None`. Consumers can't identify nodata pixels.
 
