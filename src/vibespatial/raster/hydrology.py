@@ -69,12 +69,21 @@ def _numpy_dtype_to_cuda(dtype: np.dtype) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
+def _fill_sinks_cpu(
+    raster: OwnedRasterArray,
+    *,
+    _max_iterations: int | None = None,
+) -> OwnedRasterArray:
     """CPU sink fill via iterative numpy propagation.
 
     Implements the same algorithm as the GPU path:
     border pixels keep their elevation, interior pixels start at +inf,
     then iteratively lowered to max(own_elev, min(neighbor_fills)).
+
+    Parameters
+    ----------
+    _max_iterations : int or None
+        Override for max iteration count (testing only).
     """
     t0 = time.perf_counter()
 
@@ -108,7 +117,8 @@ def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     fill[nodata_mask] = -np.inf
 
     # Iterative propagation
-    max_iterations = max(height + width, 1000)
+    max_iterations = _max_iterations if _max_iterations is not None else max(height + width, 1000)
+    converged = False
     iterations = 0
     for iterations in range(1, max_iterations + 1):
         changed = False
@@ -144,7 +154,16 @@ def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
             changed = True
 
         if not changed:
+            converged = True
             break
+
+    if not converged:
+        logger.warning(
+            "fill_sinks_cpu did NOT converge after %d iterations "
+            "(pixels=%d). Result may contain unfilled depressions.",
+            iterations,
+            height * width,
+        )
 
     # Restore nodata pixels to original values
     if raster.nodata is not None:
@@ -168,6 +187,7 @@ def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(
                 f"fill_sinks_cpu iterations={iterations} "
+                f"converged={converged} "
                 f"pixels={height * width} elapsed={elapsed:.3f}s"
             ),
             residency=result.residency,
@@ -175,9 +195,23 @@ def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
             elapsed_seconds=elapsed,
         )
     )
+    if not converged:
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=(
+                    f"WARNING: fill_sinks_cpu did not converge after "
+                    f"{iterations} iterations (max_iterations={max_iterations}). "
+                    f"Result may contain unfilled depressions."
+                ),
+                residency=result.residency,
+                visible_to_user=True,
+            )
+        )
     logger.debug(
-        "fill_sinks_cpu iterations=%d pixels=%d elapsed=%.4fs",
+        "fill_sinks_cpu iterations=%d converged=%s pixels=%d elapsed=%.4fs",
         iterations,
+        converged,
         height * width,
         elapsed,
     )
@@ -189,7 +223,11 @@ def _fill_sinks_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
 # ---------------------------------------------------------------------------
 
 
-def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
+def _fill_sinks_gpu(
+    raster: OwnedRasterArray,
+    *,
+    _max_iterations: int | None = None,
+) -> OwnedRasterArray:
     """GPU sink fill using iterative NVRTC propagation kernels.
 
     Uses shared-memory tiled 3x3 stencil kernels with convergence detection.
@@ -199,6 +237,8 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     ----------
     raster : OwnedRasterArray
         Input DEM raster (single-band, float32 or float64).
+    _max_iterations : int or None
+        Override for max iteration count (testing only).
 
     Returns
     -------
@@ -311,7 +351,7 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     # The kernel only writes changed=1 (never resets), so changes accumulate
     # across the batch. We reset d_changed only at batch boundaries.
     CONVERGENCE_BATCH_SIZE = 32
-    max_iterations = max(height + width, 1000)
+    max_iterations = _max_iterations if _max_iterations is not None else max(height + width, 1000)
     iterations = 0
 
     prop_params = (
@@ -333,6 +373,7 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
         ),
     )
 
+    converged = False
     d_changed.fill(0)
     for iterations in range(1, max_iterations + 1):
         runtime.launch(
@@ -345,8 +386,22 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
         # Check convergence only at batch boundaries
         if iterations % CONVERGENCE_BATCH_SIZE == 0:
             if int(d_changed.item()) == 0:
+                converged = True
                 break
             d_changed.fill(0)
+    else:
+        # Loop exhausted without break — perform a final convergence check
+        # for iterations since the last batch boundary.
+        if int(d_changed.item()) == 0:
+            converged = True
+
+    if not converged:
+        logger.warning(
+            "fill_sinks_gpu did NOT converge after %d iterations "
+            "(pixels=%d). Result may contain unfilled depressions.",
+            iterations,
+            height * width,
+        )
 
     # --- Restore nodata in fill array ---
     if d_nodata_mask is not None:
@@ -376,6 +431,7 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(
                 f"fill_sinks_gpu iterations={iterations} "
+                f"converged={converged} "
                 f"pixels={height * width} dtype={cuda_dtype} "
                 f"grid={grid_2d} elapsed={elapsed:.3f}s"
             ),
@@ -384,9 +440,23 @@ def _fill_sinks_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
             elapsed_seconds=elapsed,
         )
     )
+    if not converged:
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=(
+                    f"WARNING: fill_sinks_gpu did not converge after "
+                    f"{iterations} iterations (max_iterations={max_iterations}). "
+                    f"Result may contain unfilled depressions."
+                ),
+                residency=result.residency,
+                visible_to_user=True,
+            )
+        )
     logger.debug(
-        "fill_sinks_gpu iterations=%d pixels=%d dtype=%s elapsed=%.4fs",
+        "fill_sinks_gpu iterations=%d converged=%s pixels=%d dtype=%s elapsed=%.4fs",
         iterations,
+        converged,
         height * width,
         cuda_dtype,
         elapsed,

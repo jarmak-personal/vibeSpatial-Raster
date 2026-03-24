@@ -45,7 +45,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/histogram.py:132,170`
   - Non-uint8 rasters with nodata: equalized output maps nodata pixels to 0 but declares `nodata=None`. Consumers can't identify nodata pixels.
 
-- [ ] **9. Hydrology convergence: may return unconverged result silently**
+- [x] **9. Hydrology convergence: may return unconverged result silently**
   - `src/vibespatial/raster/hydrology.py:336-349`
   - Convergence checked every 32 iterations. If `max_iterations` hit without convergence at a batch boundary, last batch's changes are never verified. Result returned as if converged.
 

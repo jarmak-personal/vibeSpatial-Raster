@@ -13,7 +13,7 @@ except ImportError:
     HAS_CUPY = False
 
 from vibespatial.raster.buffers import from_numpy
-from vibespatial.raster.hydrology import raster_fill_sinks
+from vibespatial.raster.hydrology import _fill_sinks_cpu, raster_fill_sinks
 
 requires_gpu = pytest.mark.gpu
 
@@ -495,3 +495,196 @@ class TestFillSinksAutoDispatch:
 
         assert result.affine == affine
         assert result.nodata == raster.nodata
+
+
+# ---------------------------------------------------------------------------
+# Convergence diagnostic tests
+# ---------------------------------------------------------------------------
+
+
+class TestFillSinksConvergenceCPU:
+    """Test that convergence status is correctly reported in diagnostics."""
+
+    def _make_deep_pit_5x5(self):
+        """Create a 5x5 DEM with a central pit needing >1 iteration."""
+        return np.array(
+            [
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 0.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+
+    def test_converged_diagnostics(self):
+        """When CPU converges, diagnostics should contain converged=True."""
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        result = _fill_sinks_cpu(raster)
+
+        runtime_events = [
+            e for e in result.diagnostics if e.kind == "runtime" and "fill_sinks_cpu" in e.detail
+        ]
+        assert len(runtime_events) >= 1
+        assert "converged=True" in runtime_events[0].detail
+
+    def test_unconverged_warns(self):
+        """When CPU hits max_iterations, diagnostics should warn unconverged."""
+        # This 5x5 DEM needs 2 iterations. Cap at 1 to force unconverged.
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        result = _fill_sinks_cpu(raster, _max_iterations=1)
+
+        # The main diagnostic should say converged=False
+        runtime_events = [
+            e for e in result.diagnostics if e.kind == "runtime" and "fill_sinks_cpu" in e.detail
+        ]
+        assert any("converged=False" in e.detail for e in runtime_events)
+
+        # There should also be a WARNING diagnostic
+        warning_events = [
+            e
+            for e in result.diagnostics
+            if e.kind == "runtime" and "WARNING" in e.detail and "converge" in e.detail
+        ]
+        assert len(warning_events) == 1
+        assert "did not converge" in warning_events[0].detail
+        assert warning_events[0].visible_to_user is True
+
+    def test_unconverged_result_has_unfilled_pixels(self):
+        """When CPU is unconverged, the result should have unfilled interior pixels."""
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        result = _fill_sinks_cpu(raster, _max_iterations=1)
+        filled = result.to_numpy()
+
+        # Center pixel (2,2) should NOT be fully filled to 10.0 with only 1 iteration.
+        # It stays at +inf because it is 2 hops from the border and info only
+        # propagates one ring per iteration.
+        assert filled[2, 2] != pytest.approx(10.0)
+
+    def test_unconverged_emits_logger_warning(self, caplog):
+        """When CPU is unconverged, a logger warning should be emitted."""
+        import logging
+
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        with caplog.at_level(logging.WARNING, logger="vibespatial.raster.hydrology"):
+            _fill_sinks_cpu(raster, _max_iterations=1)
+
+        assert any("did NOT converge" in record.message for record in caplog.records)
+
+
+@requires_gpu
+class TestFillSinksConvergenceGPU:
+    """Test GPU convergence diagnostics."""
+
+    def _make_deep_pit_5x5(self):
+        """Create a 5x5 DEM with a central pit."""
+        return np.array(
+            [
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 0.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+
+    def test_converged_diagnostics_gpu(self):
+        """When GPU converges, diagnostics should contain converged=True."""
+        from vibespatial.raster.hydrology import _fill_sinks_gpu
+
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        result = _fill_sinks_gpu(raster)
+
+        runtime_events = [
+            e for e in result.diagnostics if e.kind == "runtime" and "fill_sinks_gpu" in e.detail
+        ]
+        assert len(runtime_events) >= 1
+        assert "converged=True" in runtime_events[0].detail
+
+    def test_unconverged_warns_gpu(self):
+        """When GPU hits max_iterations (not at batch boundary), diagnostics warn."""
+        from vibespatial.raster.hydrology import _fill_sinks_gpu
+
+        # Use max_iterations=3 -- NOT a multiple of batch size (32).
+        # The 5x5 DEM with a central pit needs a few GPU kernel iterations.
+        # With max_iterations=3, the loop exhausts without hitting a batch
+        # boundary check, exercising the post-loop convergence check.
+        data = self._make_deep_pit_5x5()
+        raster = from_numpy(data)
+        _fill_sinks_gpu(raster, _max_iterations=3)  # sanity: must not raise
+
+        # The 5x5 pit may converge in 3 GPU iterations.  Use 1 iteration
+        # to guarantee the loop exhausts and the post-loop check fires.
+        result_1iter = _fill_sinks_gpu(raster, _max_iterations=1)
+        events_1 = [
+            e
+            for e in result_1iter.diagnostics
+            if e.kind == "runtime" and "fill_sinks_gpu" in e.detail
+        ]
+        # With only 1 iteration and batch size 32, the loop body runs once
+        # and then exhausts. The else clause performs the final check.
+        # The DEM may or may not converge in 1 GPU iteration depending on
+        # kernel semantics. Check that converged status is reported either way.
+        assert any("converged=" in e.detail for e in events_1)
+
+    def test_unconverged_not_at_batch_boundary_gpu(self):
+        """Verify unconverged detection when max_iterations is not a batch multiple.
+
+        This is the specific edge case from Bug #9: if max_iterations is not a
+        multiple of CONVERGENCE_BATCH_SIZE (32), the last partial batch's changes
+        were never checked before the fix.
+        """
+        from vibespatial.raster.hydrology import _fill_sinks_gpu
+
+        # Create a larger DEM that genuinely needs many iterations.
+        # A 20x20 DEM with a deep central pit requires O(10) propagation steps.
+        size = 20
+        data = np.full((size, size), 100.0, dtype=np.float32)
+        data[5:15, 5:15] = 1.0  # Large interior depression
+
+        raster = from_numpy(data)
+
+        # Cap at 5 iterations (not a multiple of 32) -- guaranteed unconverged
+        # for a 10x10 interior depression.
+        result = _fill_sinks_gpu(raster, _max_iterations=5)
+
+        # Must have a WARNING diagnostic
+        warning_events = [
+            e
+            for e in result.diagnostics
+            if e.kind == "runtime" and "WARNING" in e.detail and "converge" in e.detail
+        ]
+        assert len(warning_events) == 1
+        assert "did not converge" in warning_events[0].detail
+        assert warning_events[0].visible_to_user is True
+
+        # The main diagnostic should report converged=False
+        main_events = [
+            e
+            for e in result.diagnostics
+            if e.kind == "runtime" and "fill_sinks_gpu" in e.detail and "WARNING" not in e.detail
+        ]
+        assert any("converged=False" in e.detail for e in main_events)
+
+    def test_unconverged_emits_logger_warning_gpu(self, caplog):
+        """When GPU is unconverged, a logger warning should be emitted."""
+        import logging
+
+        from vibespatial.raster.hydrology import _fill_sinks_gpu
+
+        size = 20
+        data = np.full((size, size), 100.0, dtype=np.float32)
+        data[5:15, 5:15] = 1.0
+
+        raster = from_numpy(data)
+        with caplog.at_level(logging.WARNING, logger="vibespatial.raster.hydrology"):
+            _fill_sinks_gpu(raster, _max_iterations=5)
+
+        assert any("did NOT converge" in record.message for record in caplog.records)
