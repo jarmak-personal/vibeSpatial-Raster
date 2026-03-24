@@ -311,3 +311,108 @@ class TestExports:
             "raster_focal_variety",
         ]:
             assert name in __all__, f"{name} not in __all__"
+
+
+# ---------------------------------------------------------------------------
+# Multi-band raster tests (Bug #6: 3D/2D nodata_mask shape mismatch)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiBandFocalStats:
+    """Verify focal stats handle multi-band (3D) rasters without crashing.
+
+    Bug #6: _focal_stat_cpu squeezes data from 3D to 2D but leaves
+    nodata_mask as 3D, causing a shape mismatch crash.
+    """
+
+    @pytest.fixture
+    def raster_3d_no_nodata(self):
+        """Single-band raster stored as (1, 5, 5) shape — no nodata."""
+        data = np.arange(1, 26, dtype=np.float64).reshape(1, 5, 5)
+        return from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 5.0))
+
+    @pytest.fixture
+    def raster_3d_with_nodata(self):
+        """Single-band raster stored as (1, 5, 5) shape — with nodata at (0,1,1)."""
+        data = np.arange(1, 26, dtype=np.float64).reshape(1, 5, 5)
+        data[0, 1, 1] = -9999.0
+        return from_numpy(data, nodata=-9999.0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 5.0))
+
+    @pytest.fixture
+    def raster_2d_with_nodata(self):
+        """Equivalent 2D raster for comparison."""
+        data = np.arange(1, 26, dtype=np.float64).reshape(5, 5)
+        data[1, 1] = -9999.0
+        return from_numpy(data, nodata=-9999.0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 5.0))
+
+    def test_focal_min_3d_no_nodata(self, raster_3d_no_nodata):
+        """3D raster without nodata should not crash."""
+        from vibespatial.raster.algebra import raster_focal_min
+
+        result = raster_focal_min(raster_3d_no_nodata, radius=1, use_gpu=False)
+        out = result.to_numpy()
+        assert out.ndim == 2
+        assert out.shape == (5, 5)
+        # Center pixel (2,2): min of [7,8,9,12,13,14,17,18,19] = 7
+        assert out[2, 2] == 7.0
+
+    def test_focal_min_3d_with_nodata(self, raster_3d_with_nodata):
+        """3D raster with nodata must not crash (the core Bug #6 scenario)."""
+        from vibespatial.raster.algebra import raster_focal_min
+
+        result = raster_focal_min(raster_3d_with_nodata, radius=1, use_gpu=False)
+        out = result.to_numpy()
+        assert out.ndim == 2
+        assert out.shape == (5, 5)
+        # Nodata pixel itself must remain nodata
+        assert out[1, 1] == -9999.0
+
+    def test_focal_min_3d_matches_2d(self, raster_3d_with_nodata, raster_2d_with_nodata):
+        """3D and equivalent 2D rasters must produce identical results."""
+        from vibespatial.raster.algebra import raster_focal_min
+
+        out_3d = raster_focal_min(raster_3d_with_nodata, radius=1, use_gpu=False).to_numpy()
+        out_2d = raster_focal_min(raster_2d_with_nodata, radius=1, use_gpu=False).to_numpy()
+        np.testing.assert_array_equal(out_3d, out_2d)
+
+    def test_all_stats_3d_with_nodata(self, raster_3d_with_nodata):
+        """All focal stat functions must handle 3D+nodata without crashing."""
+        from vibespatial.raster.algebra import (
+            raster_focal_max,
+            raster_focal_mean,
+            raster_focal_min,
+            raster_focal_range,
+            raster_focal_std,
+            raster_focal_variety,
+        )
+
+        for fn in [
+            raster_focal_min,
+            raster_focal_max,
+            raster_focal_mean,
+            raster_focal_std,
+            raster_focal_range,
+            raster_focal_variety,
+        ]:
+            result = fn(raster_3d_with_nodata, radius=1, use_gpu=False)
+            out = result.to_numpy()
+            assert out.ndim == 2, f"{fn.__name__} returned {out.ndim}D"
+            assert out.shape == (5, 5), f"{fn.__name__} shape {out.shape}"
+            # Nodata pixel must be preserved in all stats
+            assert out[1, 1] == -9999.0, f"{fn.__name__} lost nodata"
+
+    def test_metadata_preserved_3d(self, raster_3d_with_nodata):
+        """Affine, CRS, and nodata must survive through 3D focal stat."""
+        from vibespatial.raster.algebra import raster_focal_min
+
+        result = raster_focal_min(raster_3d_with_nodata, radius=1, use_gpu=False)
+        assert result.affine == raster_3d_with_nodata.affine
+        assert result.crs == raster_3d_with_nodata.crs
+        assert result.nodata == raster_3d_with_nodata.nodata
+
+    def test_diagnostics_3d(self, raster_3d_with_nodata):
+        """Diagnostic event must be emitted for 3D raster path."""
+        from vibespatial.raster.algebra import raster_focal_min
+
+        result = raster_focal_min(raster_3d_with_nodata, radius=1, use_gpu=False)
+        assert any("cpu_focal_min" in d.detail for d in result.diagnostics)

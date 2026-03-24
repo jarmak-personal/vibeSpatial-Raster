@@ -1832,6 +1832,8 @@ def _focal_stat_cpu(
         data = data[0]
 
     nodata_mask = raster.nodata_mask if raster.nodata is not None else None
+    if nodata_mask is not None and nodata_mask.ndim == 3:
+        nodata_mask = nodata_mask[0]
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     fn = _CPU_DISPATCH[stat_name]
@@ -1904,7 +1906,10 @@ def _focal_stat_gpu(
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     if raster.nodata is not None:
-        d_nodata = raster.device_nodata_mask().astype(cp.uint8)
+        d_nodata = raster.device_nodata_mask()
+        if d_nodata.ndim == 3:
+            d_nodata = d_nodata[0]
+        d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
         nodata_ptr = 0  # nullptr

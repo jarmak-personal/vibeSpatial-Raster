@@ -33,7 +33,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
 
 ## High — Logic / Semantic Bugs
 
-- [ ] **6. `_focal_stat_cpu` crashes on multi-band rasters (3D/2D shape mismatch)**
+- [x] **6. `_focal_stat_cpu` crashes on multi-band rasters (3D/2D shape mismatch)**
   - `src/vibespatial/raster/algebra.py:1834`
   - `nodata_mask` can be 3D while `data` is squeezed to 2D. Would cause shape mismatch crash.
 
