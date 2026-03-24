@@ -49,7 +49,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/hydrology.py:336-349`
   - Convergence checked every 32 iterations. If `max_iterations` hit without convergence at a batch boundary, last batch's changes are never verified. Result returned as if converged.
 
-- [ ] **10. `raster_divide` double-applies nodata masking**
+- [x] **10. `raster_divide` double-applies nodata masking**
   - `src/vibespatial/raster/algebra.py:110-125`
   - `safe_divide` replaces inf/nan with `nodata_val`, then `_binary_op` independently overlays nodata masking. Legitimate computed values matching `nodata_val` get spuriously masked.
 

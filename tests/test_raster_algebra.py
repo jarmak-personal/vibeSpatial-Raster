@@ -98,6 +98,113 @@ class TestRasterDivide:
         expected = np.array([[10.0, 10.0], [10.0, 10.0]])
         np.testing.assert_array_almost_equal(result.to_numpy(), expected)
 
+    def test_div_by_zero_yields_nodata(self):
+        """Division by zero should produce nodata, not inf."""
+        from vibespatial.raster.algebra import raster_divide
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[0.0, 1.0], [0.0, 2.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_divide(a, b)
+        data = result.to_numpy()
+        # div-by-zero positions should be nodata
+        assert data[0, 0] == -9999.0
+        assert data[1, 0] == -9999.0
+        # valid positions should be correct
+        np.testing.assert_almost_equal(data[0, 1], 2.0)
+        np.testing.assert_almost_equal(data[1, 1], 2.0)
+
+    def test_legitimate_result_equal_to_nodata_not_masked(self):
+        """Regression test for Bug #10: a legitimate division result that
+        equals the nodata sentinel must NOT be treated as nodata.
+
+        If nodata=-9999.0 and a valid division produces -9999.0 (e.g.,
+        -29997.0 / 3.0), the result pixel must be preserved, not masked.
+        """
+        from vibespatial.raster.algebra import raster_divide
+        from vibespatial.raster.buffers import from_numpy
+
+        # Construct rasters where a valid division produces exactly -9999.0
+        # -29997.0 / 3.0 = -9999.0  (a legitimate result)
+        a = from_numpy(
+            np.array([[1.0, -29997.0], [6.0, -9999.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[2.0, 3.0], [3.0, 1.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_divide(a, b)
+        data = result.to_numpy()
+
+        # [0,0]: 1.0/2.0 = 0.5 — valid
+        np.testing.assert_almost_equal(data[0, 0], 0.5)
+        # [0,1]: -29997.0/3.0 = -9999.0 — legitimate result, NOT nodata
+        # This is the key assertion: the value equals the nodata sentinel
+        # but must be preserved because neither input pixel was nodata.
+        np.testing.assert_almost_equal(data[0, 1], -9999.0)
+        # [1,0]: 6.0/3.0 = 2.0 — valid
+        np.testing.assert_almost_equal(data[1, 0], 2.0)
+        # [1,1]: a[1,1] = -9999.0 is nodata — should propagate as nodata
+        assert data[1, 1] == -9999.0
+
+    def test_nodata_propagation_in_divide(self):
+        """Input nodata pixels should propagate through division."""
+        from vibespatial.raster.algebra import raster_divide
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[10.0, -9999.0], [30.0, 40.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[2.0, 5.0], [-9999.0, 8.0]], dtype=np.float64),
+            nodata=-9999.0,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_divide(a, b)
+        data = result.to_numpy()
+        # [0,0]: valid / valid = valid
+        np.testing.assert_almost_equal(data[0, 0], 5.0)
+        # [0,1]: nodata / valid = nodata
+        assert data[0, 1] == -9999.0
+        # [1,0]: valid / nodata = nodata
+        assert data[1, 0] == -9999.0
+        # [1,1]: valid / valid = valid
+        np.testing.assert_almost_equal(data[1, 1], 5.0)
+
+    def test_div_by_zero_no_nodata_sentinel(self):
+        """Division by zero when neither raster has nodata should produce NaN."""
+        from vibespatial.raster.algebra import raster_divide
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[1.0, 2.0]], dtype=np.float64),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        b = from_numpy(
+            np.array([[0.0, 1.0]], dtype=np.float64),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        result = raster_divide(a, b)
+        data = result.to_numpy()
+        # div-by-zero should become NaN (used as nodata sentinel)
+        assert np.isnan(data[0, 0])
+        assert result.nodata is not None and np.isnan(result.nodata)
+        # valid division should be correct
+        np.testing.assert_almost_equal(data[0, 1], 2.0)
+
 
 class TestNodataPropagation:
     def test_nodata_propagated(self, raster_with_nodata, raster_b):

@@ -49,7 +49,13 @@ def _to_device_data(raster: OwnedRasterArray):
 
 
 def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
-    """Apply a binary element-wise operation on two rasters."""
+    """Apply a binary element-wise operation on two rasters.
+
+    Nodata masking is applied in a single pass here.  The ``op_func`` must
+    **not** replace inf/nan with the nodata sentinel — that is handled
+    uniformly by this function so that legitimate computed values equal to
+    the nodata sentinel are never spuriously masked.
+    """
     if a.shape != b.shape:
         raise ValueError(f"raster shapes must match for {op_name}: {a.shape} vs {b.shape}")
 
@@ -60,13 +66,28 @@ def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
 
     result_device = op_func(da, db)
 
-    # Nodata propagation: if either input is nodata, output is nodata
+    # Determine the output nodata value
     nodata = a.nodata if a.nodata is not None else b.nodata
+
+    # Build a single combined mask covering:
+    #   1. Input nodata pixels (either input is nodata -> output is nodata)
+    #   2. Inf/NaN produced by the operation (e.g., division by zero)
+    # Applying this in one pass avoids double-masking and ensures that
+    # legitimate computed values matching the nodata sentinel are preserved.
+    bad_values = cp.logical_or(cp.isinf(result_device), cp.isnan(result_device))
     if nodata is not None:
         mask_a = a.device_nodata_mask()
         mask_b = b.device_nodata_mask()
-        combined_mask = cp.logical_or(mask_a, mask_b)
+        combined_mask = cp.logical_or(cp.logical_or(mask_a, mask_b), bad_values)
         result_device = cp.where(combined_mask, nodata, result_device)
+    elif cp.any(bad_values):
+        # No nodata sentinel available — use NaN for float, 0 for integer
+        if cp.issubdtype(result_device.dtype, cp.floating):
+            result_device = cp.where(bad_values, cp.nan, result_device)
+            nodata = float("nan")
+        else:
+            result_device = cp.where(bad_values, 0, result_device)
+            nodata = 0
 
     # Build result as HOST with device state already populated
     host_data = cp.asnumpy(result_device)
@@ -113,14 +134,7 @@ def raster_divide(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
 
     def safe_divide(da, db):
         with np.errstate(divide="ignore", invalid="ignore"):
-            result = cp.true_divide(da, db)
-        # Replace inf/nan from div-by-zero with nodata
-        nodata_val = (
-            a.nodata if a.nodata is not None else (b.nodata if b.nodata is not None else 0.0)
-        )
-        bad = cp.logical_or(cp.isinf(result), cp.isnan(result))
-        result = cp.where(bad, nodata_val, result)
-        return result
+            return cp.true_divide(da, db)
 
     return _binary_op(a, b, "divide", safe_divide)
 
