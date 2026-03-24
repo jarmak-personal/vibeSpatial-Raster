@@ -126,11 +126,17 @@ class TestRasterizeGPU:
         geoms, values = two_boxes
         cpu_result = rasterize_cpu(geoms, values, simple_grid)
         gpu_result = rasterize_gpu(geoms, values, simple_grid)
-        # Allow some boundary pixel differences due to center vs edge sampling
         cpu_data = cpu_result.to_numpy()
         gpu_data = gpu_result.to_numpy()
         agreement = (cpu_data == gpu_data).mean()
-        assert agreement > 0.85, f"Agreement only {agreement:.1%}"
+        # Both GPU (NVRTC ray-casting PIP at pixel centers) and CPU
+        # (rasterio.features.rasterize) use pixel-center sampling.  For
+        # this test geometry -- integer-aligned boxes on a 10x10 grid with
+        # resolution 1.0 -- all pixel centers fall at half-integer coords,
+        # which are unambiguously inside or outside each box.  Expect near-
+        # perfect agreement.  The 95% threshold provides margin for any
+        # floating-point edge cases in the ray-casting winding test.
+        assert agreement > 0.95, f"Agreement only {agreement:.1%}"
 
 
 class TestRasterizeOwned:

@@ -17,6 +17,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 from vibespatial.residency import Residency, TransferTrigger
@@ -398,11 +399,11 @@ def _raster_histogram_equalize_gpu(
             d_flat = d_data.ravel()
             d_valid_idx = cp.flatnonzero(d_valid_mask.ravel())
             if d_valid_idx.shape[0] == 0:
-                host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
+                d_zeros = cp.zeros(original_shape, dtype=cp.uint8)
                 # Output is uint8; non-uint8 nodata mapped to 0
                 early_nodata = 0 if raster.nodata is not None else None
-                return from_numpy(
-                    host_result, nodata=early_nodata, affine=raster.affine, crs=raster.crs
+                return from_device(
+                    d_zeros, nodata=early_nodata, affine=raster.affine, crs=raster.crs
                 )
             d_valid = d_flat[d_valid_idx]
             d_min = cp.min(d_valid)
@@ -440,13 +441,13 @@ def _raster_histogram_equalize_gpu(
 
     n_valid = int(d_valid_u8.shape[0])
     if n_valid == 0:
-        host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
+        d_zeros = cp.zeros(original_shape, dtype=cp.uint8)
         # Output is uint8; for non-uint8 inputs, nodata pixels are at 0
         if raster.nodata is not None:
             early_nodata = int(raster.nodata) if raster.dtype == np.uint8 else 0
         else:
             early_nodata = None
-        return from_numpy(host_result, nodata=early_nodata, affine=raster.affine, crs=raster.crs)
+        return from_device(d_zeros, nodata=early_nodata, affine=raster.affine, crs=raster.crs)
 
     d_samples_i32 = d_valid_u8.astype(cp.int32)
     # NOTE: CCCL histogram_even requires int32 counters (atomicAdd_block
@@ -539,8 +540,7 @@ def _raster_histogram_equalize_gpu(
 
     d_result = d_output.reshape(original_shape)
 
-    # Single D2H transfer at the end
-    host_result = cp.asnumpy(d_result)
+    # Keep result on device (zero-copy)
     # Determine output nodata sentinel.  The output is always uint8.
     # - uint8 input: preserve original nodata sentinel
     # - non-uint8 input with nodata: nodata pixels were mapped to 0, declare nodata=0
@@ -549,7 +549,7 @@ def _raster_histogram_equalize_gpu(
         out_nodata = int(raster.nodata) if raster.dtype == np.uint8 else 0
     else:
         out_nodata = None
-    return from_numpy(host_result, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
+    return from_device(d_result, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
 
 
 def _raster_percentile_gpu(

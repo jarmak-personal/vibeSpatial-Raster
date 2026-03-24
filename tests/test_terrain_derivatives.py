@@ -232,7 +232,7 @@ class TestCurvature_CPU:
         np.testing.assert_array_almost_equal(interior, 0.0, decimal=10)
 
     def test_concave_surface(self):
-        """Concave (bowl) surface should have positive curvature."""
+        """Concave (bowl) surface should have negative curvature (Zevenbergen-Thorne)."""
         from vibespatial.raster.algebra import raster_curvature
 
         # Bowl: elevation = x^2 + y^2 (concave up)
@@ -241,7 +241,7 @@ class TestCurvature_CPU:
         dem = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 11.0))
         result = raster_curvature(dem, use_gpu=False)
         out = result.to_numpy()
-        # Curvature should be positive (concave) at interior points
+        # Curvature should be negative (concave bowl) at interior points
         assert out[5, 5] < 0.0  # -2*(D+E)*100, D and E are both positive -> negative
 
     def test_nodata_propagation(self, nodata_dem):

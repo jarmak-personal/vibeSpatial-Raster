@@ -20,6 +20,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 from vibespatial.residency import Residency, TransferTrigger
@@ -374,13 +375,13 @@ def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
         ),
     )
 
-    # --- D->H transfer (final) ---
-    host_distance = cp.asnumpy(d_distance).reshape(height, width)
+    # --- Keep result on device (zero-copy) ---
+    d_distance_2d = d_distance.reshape(height, width)
 
     elapsed = time.perf_counter() - t0
 
-    result = from_numpy(
-        host_distance,
+    result = from_device(
+        d_distance_2d,
         nodata=np.nan if any_nodata else None,
         affine=raster.affine,
         crs=raster.crs,

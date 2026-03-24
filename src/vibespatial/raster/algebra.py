@@ -19,6 +19,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 from vibespatial.residency import Residency, TransferTrigger
@@ -89,14 +90,13 @@ def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
             result_device = cp.where(bad_values, 0, result_device)
             nodata = 0
 
-    # Build result as HOST with device state already populated
-    host_data = cp.asnumpy(result_device)
-    result = from_numpy(host_data, nodata=nodata, affine=a.affine, crs=a.crs)
+    # Build result as DEVICE-resident (zero-copy, no D→H transfer)
+    result = from_device(result_device, nodata=nodata, affine=a.affine, crs=a.crs)
     result.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
             detail=f"raster_{op_name} shape={a.shape} dtype={a.dtype}",
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
         )
     )
     return result
@@ -167,8 +167,7 @@ def raster_apply(
         if mask is not None:
             result_device = cp.where(mask, out_nodata, result_device)
 
-    host_data = cp.asnumpy(result_device)
-    return from_numpy(host_data, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
+    return from_device(result_device, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
 
 
 def raster_where(
@@ -201,10 +200,9 @@ def raster_where(
         fv = false_val
 
     result_device = cp.where(cond_bool, tv, fv)
-    host_data = cp.asnumpy(result_device)
 
     nodata = condition.nodata
-    return from_numpy(host_data, nodata=nodata, affine=condition.affine, crs=condition.crs)
+    return from_device(result_device, nodata=nodata, affine=condition.affine, crs=condition.crs)
 
 
 def raster_classify(
@@ -244,9 +242,8 @@ def raster_classify(
         if mask is not None:
             result_device = cp.where(mask, raster.nodata, result_device)
 
-    host_data = cp.asnumpy(result_device)
-    return from_numpy(
-        host_data.astype(np.float64),
+    return from_device(
+        result_device.astype(cp.float64, copy=False),
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
@@ -483,18 +480,14 @@ def _raster_expression_gpu(
         params=params,
     )
 
-    # Transfer result to host
-    host_result = cp.asnumpy(d_output)
-    host_mask = cp.asnumpy(d_output_mask)
-
-    # Apply nodata where output mask is set
+    # Apply nodata where output mask is set (device-side)
     if nodata is not None:
-        host_result[host_mask.astype(bool)] = nodata
+        d_output = cp.where(d_output_mask.astype(cp.bool_), nodata, d_output)
 
     elapsed = time.perf_counter() - t0
 
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_output,
         nodata=nodata,
         affine=first_raster.affine,
         crs=first_raster.crs,
@@ -506,7 +499,7 @@ def _raster_expression_gpu(
                 f"gpu_kernel=raster_expression pixels={n_pixels} "
                 f"inputs={len(var_names)} expr={expression!r}"
             ),
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
             visible_to_user=True,
             elapsed_seconds=elapsed,
         )
@@ -822,9 +815,8 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
         shared_mem_bytes=shared_mem_bytes,
     )
 
-    host_result = cp.asnumpy(d_output)
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_output,
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
@@ -833,7 +825,7 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(f"gpu_convolve {width}x{height} kernel={kw}x{kh} smem={shared_mem_bytes}B"),
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
         )
     )
     return result
@@ -1113,11 +1105,11 @@ def _gpu_slope_aspect(
         params=params,
     )
 
-    # Transfer results to host only at the end
-    slope_host = cp.asnumpy(d_slope) if compute_slope else None
-    aspect_host = cp.asnumpy(d_aspect) if compute_aspect else None
+    # Return device arrays directly (zero-copy, no D→H transfer)
+    slope_dev = d_slope if compute_slope else None
+    aspect_dev = d_aspect if compute_aspect else None
 
-    return slope_host, aspect_host
+    return slope_dev, aspect_dev
 
 
 def raster_slope(
@@ -1145,29 +1137,41 @@ def raster_slope(
     orig_dtype = dem.dtype
 
     if use_gpu:
-        slope_host, _ = _gpu_slope_aspect(dem, compute_slope=True, compute_aspect=False)
-        backend = "gpu"
+        slope_dev, _ = _gpu_slope_aspect(dem, compute_slope=True, compute_aspect=False)
+        # Restore original dtype for float inputs (float32 in -> float32 out)
+        if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+            slope_dev = slope_dev.astype(orig_dtype)
+        result = from_device(
+            slope_dev,
+            nodata=dem.nodata,
+            affine=dem.affine,
+            crs=dem.crs,
+        )
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=f"gpu_slope_fused {slope_dev.shape[1]}x{slope_dev.shape[0]}",
+                residency=Residency.DEVICE,
+            )
+        )
     else:
         slope_host, _ = _cpu_slope_aspect(dem, compute_slope=True, compute_aspect=False)
-        backend = "cpu"
-
-    # Restore original dtype for float inputs (float32 in -> float32 out)
-    if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
-        slope_host = slope_host.astype(orig_dtype)
-
-    result = from_numpy(
-        slope_host,
-        nodata=dem.nodata,
-        affine=dem.affine,
-        crs=dem.crs,
-    )
-    result.diagnostics.append(
-        RasterDiagnosticEvent(
-            kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"{backend}_slope_fused {slope_host.shape[1]}x{slope_host.shape[0]}",
-            residency=Residency.HOST,
+        # Restore original dtype for float inputs (float32 in -> float32 out)
+        if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+            slope_host = slope_host.astype(orig_dtype)
+        result = from_numpy(
+            slope_host,
+            nodata=dem.nodata,
+            affine=dem.affine,
+            crs=dem.crs,
         )
-    )
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=f"cpu_slope_fused {slope_host.shape[1]}x{slope_host.shape[0]}",
+                residency=Residency.HOST,
+            )
+        )
     return result
 
 
@@ -1196,29 +1200,41 @@ def raster_aspect(
     orig_dtype = dem.dtype
 
     if use_gpu:
-        _, aspect_host = _gpu_slope_aspect(dem, compute_slope=False, compute_aspect=True)
-        backend = "gpu"
+        _, aspect_dev = _gpu_slope_aspect(dem, compute_slope=False, compute_aspect=True)
+        # Restore original dtype for float inputs (float32 in -> float32 out)
+        if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+            aspect_dev = aspect_dev.astype(orig_dtype)
+        result = from_device(
+            aspect_dev,
+            nodata=dem.nodata,
+            affine=dem.affine,
+            crs=dem.crs,
+        )
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=f"gpu_aspect_fused {aspect_dev.shape[1]}x{aspect_dev.shape[0]}",
+                residency=Residency.DEVICE,
+            )
+        )
     else:
         _, aspect_host = _cpu_slope_aspect(dem, compute_slope=False, compute_aspect=True)
-        backend = "cpu"
-
-    # Restore original dtype for float inputs (float32 in -> float32 out)
-    if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
-        aspect_host = aspect_host.astype(orig_dtype)
-
-    result = from_numpy(
-        aspect_host,
-        nodata=dem.nodata,
-        affine=dem.affine,
-        crs=dem.crs,
-    )
-    result.diagnostics.append(
-        RasterDiagnosticEvent(
-            kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"{backend}_aspect_fused {aspect_host.shape[1]}x{aspect_host.shape[0]}",
-            residency=Residency.HOST,
+        # Restore original dtype for float inputs (float32 in -> float32 out)
+        if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
+            aspect_host = aspect_host.astype(orig_dtype)
+        result = from_numpy(
+            aspect_host,
+            nodata=dem.nodata,
+            affine=dem.affine,
+            crs=dem.crs,
         )
-    )
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=f"cpu_aspect_fused {aspect_host.shape[1]}x{aspect_host.shape[0]}",
+                residency=Residency.HOST,
+            )
+        )
     return result
 
 
@@ -1422,12 +1438,10 @@ def _hillshade_gpu(
         shared_mem_bytes=smem_bytes,
     )
 
-    # D2H transfer (final result only -- zero-copy compliant)
-    host_result = cp.asnumpy(d_output)
     elapsed = _time.perf_counter() - t0
 
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_output,
         nodata=int(nodata_out) if dem.nodata is not None else None,
         affine=dem.affine,
         crs=dem.crs,
@@ -1438,7 +1452,7 @@ def _hillshade_gpu(
             detail=(
                 f"gpu_hillshade {width}x{height} blocks={grid[0]}x{grid[1]} smem={smem_bytes}B"
             ),
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
             visible_to_user=True,
             elapsed_seconds=elapsed,
         )
@@ -1626,12 +1640,11 @@ def _terrain_derivative_gpu(
         params=params,
     )
 
-    host_result = cp.asnumpy(d_output)
     elapsed = time.perf_counter() - t0
 
     deriv_names = {_DERIV_TRI: "TRI", _DERIV_TPI: "TPI", _DERIV_CURV: "curvature"}
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_output,
         nodata=nodata_val,
         affine=dem.affine,
         crs=dem.crs,
@@ -1643,7 +1656,7 @@ def _terrain_derivative_gpu(
                 f"gpu_terrain_{deriv_names.get(deriv_type, 'unknown')} "
                 f"{width}x{height} blocks={grid[0]}x{grid[1]}"
             ),
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
             elapsed_seconds=elapsed,
         )
     )
@@ -1967,11 +1980,10 @@ def _focal_stat_gpu(
 
     runtime.launch(kernel=kernel, grid=grid, block=block, params=params)
 
-    host_result = cp.asnumpy(d_output)
     elapsed = time.monotonic() - t0
 
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_output,
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
@@ -1983,7 +1995,7 @@ def _focal_stat_gpu(
                 f"gpu_focal_{stat_name} {width}x{height} "
                 f"radius=({radius_y},{radius_x}) blocks={grid}"
             ),
-            residency=Residency.HOST,
+            residency=Residency.DEVICE,
             visible_to_user=True,
             elapsed_seconds=elapsed,
         )

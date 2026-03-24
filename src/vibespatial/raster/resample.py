@@ -29,6 +29,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 
@@ -275,19 +276,17 @@ def _resample_gpu(
         params=params,
     )
 
-    # Transfer result to host and build OwnedRasterArray
-    host_result = cp.asnumpy(d_dst)
-
-    # If we upcast, convert back to original dtype
+    # Keep result on device (zero-copy)
+    # If we upcast, convert back to original dtype on device
     if needs_cast and np.issubdtype(raster.dtype, np.integer):
-        host_result = np.round(host_result).astype(raster.dtype)
+        d_dst = cp.around(d_dst).astype(raster.dtype)
     elif needs_cast:
-        host_result = host_result.astype(raster.dtype)
+        d_dst = d_dst.astype(raster.dtype)
 
     elapsed = time.perf_counter() - t0
 
-    result = from_numpy(
-        host_result,
+    result = from_device(
+        d_dst,
         nodata=raster.nodata,
         affine=target_grid.affine,
         crs=raster.crs,

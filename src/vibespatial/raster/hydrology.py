@@ -20,6 +20,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 from vibespatial.residency import Residency, TransferTrigger
@@ -413,15 +414,12 @@ def _fill_sinks_gpu(
             nodata_val = work_dtype.type(raster.nodata)
             d_fill[d_nodata_bool] = nodata_val
 
-    # --- D->H transfer (final) ---
-    host_fill = cp.asnumpy(d_fill).reshape(height, width)
-
-    # Cast back to original dtype
-    result_data = host_fill.astype(raster.dtype)
+    # --- Keep result on device (zero-copy) ---
+    d_fill_2d = d_fill.reshape(height, width).astype(raster.dtype)
 
     elapsed = time.perf_counter() - t0
-    result = from_numpy(
-        result_data,
+    result = from_device(
+        d_fill_2d,
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,

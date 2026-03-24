@@ -453,10 +453,10 @@ def label_gpu(
 
     if d_fg_count == 0:
         # No foreground pixels at all
-        host_labels = np.zeros((height, width), dtype=np.int32)
+        d_zero_labels = cp.zeros((height, width), dtype=np.int32)
         elapsed = time.perf_counter() - t0
-        result = from_numpy(
-            host_labels,
+        result = from_device(
+            d_zero_labels,
             nodata=0,
             affine=raster.affine,
             crs=raster.crs,
@@ -506,15 +506,15 @@ def label_gpu(
         ),
     )
 
-    # --- D->H transfer (final, single transfer) ---
-    host_labels = cp.asnumpy(d_labels).reshape(height, width)
+    # --- Keep result on device (zero-copy) ---
+    d_labels_2d = d_labels.reshape(height, width)
 
     # num_components is already an int (from d_unique_roots.shape[0])
     num_components_int = int(num_components)
 
     elapsed = time.perf_counter() - t0
-    result = from_numpy(
-        host_labels,
+    result = from_device(
+        d_labels_2d,
         nodata=0,
         affine=raster.affine,
         crs=raster.crs,
@@ -703,13 +703,13 @@ def morphology_gpu(
     # After the loop, the result is in current_in (last swap put it there)
     d_result = current_in
 
-    # --- D->H transfer ---
-    host_result = cp.asnumpy(d_result).reshape(height, width)
+    # --- Keep result on device (zero-copy) ---
+    d_result_2d = d_result.reshape(height, width).astype(cp.uint8)
     elapsed = time.perf_counter() - t0
     kernel_launches = len(ops_sequence)
 
-    result = from_numpy(
-        host_result.astype(np.uint8),
+    result = from_device(
+        d_result_2d,
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
@@ -832,12 +832,12 @@ def _morphology_nxn_gpu(
         # --- General NxN 2-D kernel ---
         d_result = _run_nxn_morph(runtime, d_input, d_output, width, height, n, se, ops_sequence)
 
-    # --- D->H transfer ---
-    host_result = cp.asnumpy(d_result).reshape(height, width)
+    # --- Keep result on device (zero-copy) ---
+    d_result_2d = d_result.reshape(height, width).astype(cp.uint8)
     elapsed = time.perf_counter() - t0
 
-    result = from_numpy(
-        host_result.astype(np.uint8),
+    result = from_device(
+        d_result_2d,
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
@@ -1325,12 +1325,12 @@ def _sieve_gpu(
         d_sizes_below[nodata_label] = False
     removed_count = int(cp.sum(d_sizes_below).item())
 
-    # --- D->H transfer (final) ---
-    host_result = cp.asnumpy(d_output).reshape(height, width)
+    # --- Keep result on device (zero-copy) ---
+    d_output_2d = d_output.reshape(height, width).astype(cp.int32)
 
     elapsed = time.perf_counter() - t0
-    result = from_numpy(
-        host_result.astype(np.int32),
+    result = from_device(
+        d_output_2d,
         nodata=nodata,
         affine=labeled.affine,
         crs=labeled.crs,

@@ -17,6 +17,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 
@@ -383,9 +384,9 @@ def rasterize_gpu(
         shared_mem_bytes=smem_bytes,
     )
 
-    result_data = cp.asnumpy(d_out).reshape(grid_spec.height, grid_spec.width)
-    return from_numpy(
-        result_data.astype(grid_spec.dtype),
+    d_result = d_out.reshape(grid_spec.height, grid_spec.width).astype(grid_spec.dtype)
+    return from_device(
+        d_result,
         nodata=grid_spec.fill_value,
         affine=grid_spec.affine,
     )

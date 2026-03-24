@@ -14,7 +14,7 @@ try:
 except ImportError:
     HAS_GPU = False
 
-requires_gpu = pytest.mark.gpu
+requires_gpu = pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 skip_no_gpu = pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
 
 

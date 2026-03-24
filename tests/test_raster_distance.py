@@ -255,7 +255,11 @@ class TestDistanceTransformGPU:
         raster = from_numpy(data)
         gpu_result = raster_distance_transform(raster, use_gpu=True)
         cpu_result = raster_distance_transform(raster, use_gpu=False)
-        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.5)
+        # JFA (Jump Flooding Algorithm) is an approximation of exact EDT.
+        # For a single seed on a small 5x5 grid, JFA+2 refinement should
+        # converge to the exact Voronoi diagram.  Allow atol=0.1 for minor
+        # floating-point differences in the sqrt computation.
+        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.1)
 
     def test_random_matches_cpu(self):
         """GPU EDT should closely approximate CPU EDT on random data."""
@@ -264,9 +268,13 @@ class TestDistanceTransformGPU:
         raster = from_numpy(data)
         gpu_result = raster_distance_transform(raster, use_gpu=True)
         cpu_result = raster_distance_transform(raster, use_gpu=False)
-        # JFA is approximate but should be very close for most pixels.
-        # Allow tolerance of 0.5 pixel for JFA approximation artifacts.
-        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.5)
+        # JFA (Jump Flooding Algorithm) is an O(log N) approximation of
+        # exact EDT (scipy).  JFA+2 refinement reduces worst-case error to
+        # well under 0.5 pixels for typical data.  On a 32x32 grid with
+        # ~30% foreground density (seed spacing ~3px), Voronoi boundaries
+        # are close to seeds, limiting propagation error.  Tolerance of 0.15
+        # covers the observed JFA+2 residual for this seed density.
+        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.15)
 
     def test_all_foreground(self):
         """GPU: all foreground pixels should have distance 0."""
@@ -309,7 +317,11 @@ class TestDistanceTransformGPU:
         result = raster_distance_transform(raster, use_gpu=True)
         dist = result.to_numpy()
         assert dist[0, 2] == 0.0
-        assert dist[0, 0] == pytest.approx(2.0, abs=0.5)
+        # 1D distance from pixel 0 to the sole foreground pixel at index 2
+        # is exactly 2.0.  JFA on a 1x5 grid with one seed is trivial --
+        # a single pass propagates the seed to all pixels.  Allow minimal
+        # floating-point tolerance only.
+        assert dist[0, 0] == pytest.approx(2.0, abs=1e-6)
 
     def test_larger_raster(self):
         """GPU: larger raster should produce reasonable distances."""
@@ -318,7 +330,11 @@ class TestDistanceTransformGPU:
         raster = from_numpy(data)
         gpu_result = raster_distance_transform(raster, use_gpu=True)
         cpu_result = raster_distance_transform(raster, use_gpu=False)
-        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.5)
+        # 64x64 grid with ~20% foreground density.  JFA+2 refinement on a
+        # grid this size (next_pow2=64, log2=6 passes + 2 refinement) should
+        # converge well.  Sparse seeds increase max Voronoi cell radius but
+        # JFA+2 handles this.  atol=0.2 is conservative for this regime.
+        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.2)
 
     def test_non_square_raster(self):
         """GPU: non-square rasters should work correctly."""
@@ -327,7 +343,11 @@ class TestDistanceTransformGPU:
         raster = from_numpy(data)
         gpu_result = raster_distance_transform(raster, use_gpu=True)
         cpu_result = raster_distance_transform(raster, use_gpu=False)
-        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.5)
+        # Non-square 5x20 grid with a single seed.  JFA uses
+        # next_pow2(max(5, 20)) = 32, giving 5 main passes + 2 refinement.
+        # Single-seed cases produce exact Voronoi diagrams after enough
+        # passes.  Allow atol=0.1 for floating-point sqrt differences.
+        np.testing.assert_allclose(gpu_result.to_numpy(), cpu_result.to_numpy(), atol=0.1)
 
     def test_diagnostics_present(self):
         """GPU result should include diagnostic events."""

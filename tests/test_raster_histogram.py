@@ -482,6 +482,7 @@ class TestRasterPercentileCPU:
         # 0th percentile should be close to min
         assert abs(result[0] - float(np.min(data))) < 1.0
         # 100th percentile should be close to max (within bin width)
+        assert abs(result[1] - float(np.max(data))) < 1.0
 
     def test_nodata_excluded(self, raster_with_nodata):
         from vibespatial.raster.histogram import raster_percentile
@@ -711,7 +712,16 @@ class TestRasterPercentileGPU:
 
         cpu_result = raster_percentile(raster_float, [25.0, 50.0, 75.0], bins=256, use_gpu=False)
         gpu_result = raster_percentile(raster_float, [25.0, 50.0, 75.0], bins=256, use_gpu=True)
-        np.testing.assert_array_almost_equal(cpu_result, gpu_result, decimal=0)
+        # Both GPU and CPU percentile paths use the same algorithm:
+        # histogram -> cumulative sum -> searchsorted on host.  The GPU
+        # uses CCCL histogram_even + exclusive_sum, the CPU uses
+        # np.histogram + np.cumsum.  Histogram counts match exactly
+        # (verified by TestRasterHistogramGPU.test_gpu_matches_cpu), and
+        # edges are both computed via np.linspace from the same [lo, hi].
+        # Therefore percentile values should match within floating-point
+        # rounding of the CDF cumsum.  Use decimal=5 (atol ~1e-5) to
+        # account for float64 accumulation order differences.
+        np.testing.assert_array_almost_equal(cpu_result, gpu_result, decimal=5)
 
     def test_gpu_ordered_percentiles(self, raster_float):
         from vibespatial.raster.histogram import raster_percentile

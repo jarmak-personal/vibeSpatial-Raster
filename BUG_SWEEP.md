@@ -2,7 +2,7 @@
 
 Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Python logic, device residency, test correctness, algorithm correctness, codebase explorer).
 
-**Tally: 5 critical, 7 high, 6 medium, 4 low, 5 test issues = 27 findings**
+**Tally: 5 critical, 7 high, 6 medium, 4 low, 5 test issues = 27 findings — ALL RESOLVED**
 
 ---
 
@@ -92,7 +92,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
 
 ## Low — Performance / Architecture Issues
 
-- [ ] **19. Systemic: all 19 GPU functions return HOST-resident results via `cp.asnumpy() + from_numpy()`**
+- [x] **19. Systemic: all 19 GPU functions return HOST-resident results via `cp.asnumpy() + from_numpy()`**
   - Every GPU function forces D->H at output. Any multi-stage pipeline (e.g., label -> sieve -> polygonize) bounces through host between every step. `from_device()` exists but is never used for return values.
   - Affected functions: `_binary_op`, `raster_apply`, `raster_where`, `raster_classify`, `_raster_expression_gpu`, `_gpu_convolve`, `_gpu_slope_aspect`, `_hillshade_gpu`, `_terrain_derivative_gpu`, `_focal_stat_gpu`, `label_gpu`, `morphology_gpu`, `_morphology_nxn_gpu`, `_sieve_gpu`, `_distance_transform_gpu`, `rasterize_gpu`, `_resample_gpu`, `_fill_sinks_gpu`, `_raster_histogram_equalize_gpu`.
 
@@ -114,24 +114,26 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
 
 ## Test Suite Issues
 
-- [ ] **23. `zonal_stats_gdf` has ZERO test coverage**
+- [x] **23. `zonal_stats_gdf` has ZERO test coverage**
   - Exported public function with no tests anywhere.
+  - **Fixed:** Added 21 tests in `tests/test_raster_zonal.py` covering: basic functionality (single/multiple zones, all 7 statistics, default stats, ZonalSpec parameter, gdf_index column), nodata handling (sentinel exclusion, NaN nodata, all-nodata zones), edge cases (empty GeoDataFrame, zone outside raster extent, non-default GDF index, single-pixel zone, overlapping polygons, constant-value rasters), custom grid_spec, dispatch/diagnostics, and integer dtype value rasters (int32, uint8).
 
-- [ ] **24. Inconsistent `requires_gpu` across test files**
+- [x] **24. Inconsistent `requires_gpu` across test files**
   - Some files use `pytest.mark.gpu` (marker only, no skip), others use `pytest.mark.skipif`.
   - Files with marker-only: `test_raster_expression.py:17`, `test_raster_hillshade.py:17`.
   - Files with actual skip: `test_raster_distance.py:27`, `test_raster_buffers.py:31`.
   - New GPU tests in marker-only files will crash on CI without GPU instead of being skipped.
 
-- [ ] **25. Missing assertion: `test_0_and_100_percentiles`**
+- [x] **25. Missing assertion: `test_0_and_100_percentiles`**
   - `tests/test_raster_histogram.py:201`
   - 100th percentile assertion is commented but never written.
 
-- [ ] **26. Curvature test docstring contradicts assertion**
+- [x] **26. Curvature test docstring contradicts assertion**
   - `tests/test_terrain_derivatives.py:234-245`
   - Docstring says "positive curvature" but asserts `< 0.0`. The assertion is correct; the docstring is wrong.
 
-- [ ] **27. Loose GPU test tolerances may hide real bugs**
+- [x] **27. Loose GPU test tolerances may hide real bugs**
   - GPU EDT: `atol=0.5` (`test_raster_distance.py:258,269,312,321,330`)
   - Rasterize GPU/CPU agreement: 85% threshold (`test_raster_rasterize.py:133`)
   - Histogram percentile GPU vs CPU: `decimal=0` (`test_raster_histogram.py:339`)
+  - **Fixed:** Tightened all tolerances with explanatory comments. EDT: 0.5 -> 0.1-0.2 (JFA+2 refinement converges well on small grids); 1D uint8 case: 0.5 -> 1e-6 (trivial single-seed). Rasterize: 85% -> 95% (integer-aligned boxes, half-integer pixel centers = no boundary ambiguity). Histogram percentile: decimal=0 -> decimal=5 (both paths use identical histogram-to-CDF-to-searchsorted logic).
