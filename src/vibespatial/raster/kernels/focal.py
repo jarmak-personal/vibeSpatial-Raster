@@ -758,7 +758,7 @@ extern "C" __global__ void focal_stats(
         case 1: result = v_max; break;                           // max
         case 2: result = welford_mean; break;                    // mean
         case 3:                                                  // std
-            result = (count > 1) ? sqrt(welford_m2 / (double)(count - 1)) : 0.0;
+            result = (count > 1) ? sqrt(welford_m2 / (double)count) : 0.0;
             break;
         case 4: result = v_max - v_min; break;                   // range
         case 5: result = (double)n_uniq; break;                  // variety

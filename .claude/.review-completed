@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-24T05:18:28Z",
-  "staged_hash": "67e8fb682f53020a0068e6cfe7ab09aad6a9e4950f3ef85a06f4d092accf7097",
-  "files": [".claude/.review-completed","BUG_SWEEP.md","src/vibespatial/raster/algebra.py","tests/test_raster_algebra.py"],
+  "timestamp": "2026-03-24T11:35:45Z",
+  "staged_hash": "8841de431a33cd9d9e0074a33abf6ef53030e6d2dafbce74612528d441636a31",
+  "files": [".claude/.review-completed","BUG_SWEEP.md","src/vibespatial/raster/algebra.py","src/vibespatial/raster/kernels/focal.py","tests/test_focal_stats.py"],
   "verdict": "LAND"
 }

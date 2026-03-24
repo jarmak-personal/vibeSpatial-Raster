@@ -1765,7 +1765,7 @@ def _focal_mean_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask,
 
 
 def _focal_std_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
-    """CPU focal std (sample std, ddof=1) via scipy generic_filter."""
+    """CPU focal std (population std, ddof=0) via scipy generic_filter."""
     from scipy.ndimage import generic_filter
 
     size = (2 * radius_y + 1, 2 * radius_x + 1)
@@ -1775,9 +1775,9 @@ def _focal_std_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, 
 
     def _fn(values):
         valid = values[~np.isnan(values)]
-        if len(valid) <= 1:
+        if len(valid) == 0:
             return 0.0
-        return valid.std(ddof=1)
+        return valid.std(ddof=0)
 
     result = generic_filter(work, _fn, size=size, mode="constant", cval=np.nan)
     if nodata_mask is not None and nodata_val is not None:
@@ -2248,7 +2248,7 @@ def raster_focal_std(
     *,
     use_gpu: bool | None = None,
 ) -> OwnedRasterArray:
-    """Compute focal (neighborhood) standard deviation (sample, ddof=1).
+    """Compute focal (neighborhood) standard deviation (population, ddof=0).
 
     Uses Welford's online algorithm on GPU to avoid catastrophic cancellation.
 

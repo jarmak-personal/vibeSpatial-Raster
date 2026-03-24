@@ -53,11 +53,11 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/algebra.py:110-125`
   - `safe_divide` replaces inf/nan with `nodata_val`, then `_binary_op` independently overlays nodata masking. Legitimate computed values matching `nodata_val` get spuriously masked.
 
-- [~] **11. GPU slope/aspect boundary: 0-fill vs CPU edge-replication**
+- [x] **11. GPU slope/aspect boundary: 0-fill vs CPU edge-replication**
   - `src/vibespatial/raster/kernels/focal.py:161-170`
   - GPU fills out-of-bounds halo with `0.0`; CPU uses `np.pad(mode="edge")`. Border pixels get artificially steep slopes on GPU, creating CPU/GPU inconsistency.
 
-- [ ] **12. Focal std vs zonal std: ddof inconsistency**
+- [~] **12. Focal std vs zonal std: ddof inconsistency**
   - `kernels/focal.py:763` uses `n-1` (sample std); `zonal.py:160` uses `n` (population std).
   - Same library, different conventions.
 

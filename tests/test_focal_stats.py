@@ -139,8 +139,8 @@ class TestFocalStdCPU:
 
         result = raster_focal_std(raster_5x5, radius=1, use_gpu=False)
         out = result.to_numpy()
-        # Center (2,2): std([7,8,9,12,13,14,17,18,19]) = 4.183... (ddof=1)
-        expected = np.std([7, 8, 9, 12, 13, 14, 17, 18, 19], ddof=1)
+        # Center (2,2): population std([7,8,9,12,13,14,17,18,19]) = 3.944... (ddof=0)
+        expected = np.std([7, 8, 9, 12, 13, 14, 17, 18, 19], ddof=0)
         np.testing.assert_almost_equal(out[2, 2], expected, decimal=5)
 
 
@@ -416,3 +416,124 @@ class TestMultiBandFocalStats:
 
         result = raster_focal_min(raster_3d_with_nodata, radius=1, use_gpu=False)
         assert any("cpu_focal_min" in d.detail for d in result.diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# Population std (ddof=0) consistency tests — Bug #12
+# ---------------------------------------------------------------------------
+
+
+class TestFocalStdPopulation:
+    """Verify focal std uses population std (ddof=0) matching GIS convention."""
+
+    def test_cpu_focal_std_is_population(self, raster_5x5):
+        """CPU focal std must match np.std(ddof=0) for every interior pixel."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        result = raster_focal_std(raster_5x5, radius=1, use_gpu=False)
+        out = result.to_numpy()
+        data = raster_5x5.to_numpy()
+
+        # Check all fully interior pixels (rows 1-3, cols 1-3)
+        for r in range(1, 4):
+            for c in range(1, 4):
+                window = data[r - 1 : r + 2, c - 1 : c + 2].ravel()
+                expected_pop = np.std(window, ddof=0)
+                np.testing.assert_almost_equal(
+                    out[r, c],
+                    expected_pop,
+                    decimal=10,
+                    err_msg=f"CPU focal std at ({r},{c}) does not match population std",
+                )
+
+    def test_cpu_focal_std_not_sample(self, raster_5x5):
+        """CPU focal std must NOT match np.std(ddof=1) — regression guard."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        result = raster_focal_std(raster_5x5, radius=1, use_gpu=False)
+        out = result.to_numpy()
+        data = raster_5x5.to_numpy()
+
+        # Center (2,2) has a full 3x3 window
+        window = data[1:4, 1:4].ravel()
+        sample_std = np.std(window, ddof=1)
+        pop_std = np.std(window, ddof=0)
+        # These differ for n=9: sample / pop = sqrt(9/8)
+        assert sample_std != pop_std, "Test data does not distinguish ddof=0 from ddof=1"
+        # Result must match population, not sample
+        np.testing.assert_almost_equal(out[2, 2], pop_std, decimal=10)
+        assert abs(out[2, 2] - sample_std) > 1e-6, (
+            "Focal std appears to use sample std (ddof=1) instead of population std (ddof=0)"
+        )
+
+    def test_single_valid_pixel_returns_zero(self):
+        """A window with exactly one valid pixel must return std=0.0."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        # 3x3 raster: center=5.0, all others=nodata
+        data = np.full((3, 3), -9999.0, dtype=np.float64)
+        data[1, 1] = 5.0
+        raster = from_numpy(data, nodata=-9999.0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+
+        result = raster_focal_std(raster, radius=1, use_gpu=False)
+        out = result.to_numpy()
+        # Center pixel: only 1 valid neighbor (itself) -> std = 0.0
+        assert out[1, 1] == 0.0
+
+    def test_uniform_window_returns_zero(self):
+        """A window with all identical values must return std=0.0."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        data = np.full((5, 5), 42.0, dtype=np.float64)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 5.0))
+        result = raster_focal_std(raster, radius=1, use_gpu=False)
+        np.testing.assert_array_almost_equal(result.to_numpy(), 0.0)
+
+
+@requires_gpu
+@pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
+class TestFocalStdPopulationGPU:
+    """GPU focal std must also use population std and match CPU exactly."""
+
+    def test_gpu_focal_std_is_population(self, raster_5x5):
+        """GPU focal std must match np.std(ddof=0) for interior pixels."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        result = raster_focal_std(raster_5x5, radius=1, use_gpu=True)
+        out = result.to_numpy()
+        data = raster_5x5.to_numpy()
+
+        for r in range(1, 4):
+            for c in range(1, 4):
+                window = data[r - 1 : r + 2, c - 1 : c + 2].ravel()
+                expected_pop = np.std(window, ddof=0)
+                np.testing.assert_almost_equal(
+                    out[r, c],
+                    expected_pop,
+                    decimal=5,
+                    err_msg=f"GPU focal std at ({r},{c}) does not match population std",
+                )
+
+    def test_gpu_cpu_focal_std_match(self, raster_5x5):
+        """GPU and CPU focal std must produce identical results (both ddof=0)."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        cpu = raster_focal_std(raster_5x5, radius=1, use_gpu=False).to_numpy()
+        gpu = raster_focal_std(raster_5x5, radius=1, use_gpu=True).to_numpy()
+        np.testing.assert_array_almost_equal(gpu, cpu, decimal=5)
+
+    def test_gpu_focal_std_not_sample(self, raster_5x5):
+        """GPU focal std must NOT match np.std(ddof=1) — regression guard."""
+        from vibespatial.raster.algebra import raster_focal_std
+
+        result = raster_focal_std(raster_5x5, radius=1, use_gpu=True)
+        out = result.to_numpy()
+        data = raster_5x5.to_numpy()
+
+        window = data[1:4, 1:4].ravel()
+        sample_std = np.std(window, ddof=1)
+        pop_std = np.std(window, ddof=0)
+        np.testing.assert_almost_equal(out[2, 2], pop_std, decimal=5)
+        assert abs(out[2, 2] - sample_std) > 1e-6, (
+            "GPU focal std appears to use sample std (ddof=1) instead of population std"
+        )
