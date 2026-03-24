@@ -108,6 +108,127 @@ class TestNodataMask:
 
 
 # ---------------------------------------------------------------------------
+# Nodata mask on device-resident rasters (bug #2 regression tests)
+# ---------------------------------------------------------------------------
+
+
+class TestNodataMaskDeviceResident:
+    """Verify nodata_mask materializes host data before computing the mask.
+
+    Rasters created via from_device() have uninitialized host memory
+    (np.empty). Without the fix in nodata_mask, accessing the property
+    returns a garbage mask derived from that uninitialized memory.
+    """
+
+    @requires_gpu
+    def test_integer_nodata_from_device(self):
+        """nodata_mask on device-resident raster with integer nodata."""
+        import cupy as cp
+
+        data_np = np.array([[1, -9999], [3, -9999]], dtype=np.int32)
+        device_arr = cp.asarray(data_np)
+        raster = from_device(device_arr, nodata=-9999)
+
+        # Raster is device-resident with uninitialized host placeholder
+        assert raster.residency is Residency.DEVICE
+        assert raster._host_materialized is False
+
+        mask = raster.nodata_mask
+        expected = np.array([[False, True], [False, True]])
+        np.testing.assert_array_equal(mask, expected)
+
+    @requires_gpu
+    def test_float_nodata_from_device(self):
+        """nodata_mask on device-resident raster with float nodata sentinel."""
+        import cupy as cp
+
+        data_np = np.array([[1.0, -9999.0], [3.0, -9999.0]], dtype=np.float32)
+        device_arr = cp.asarray(data_np)
+        raster = from_device(device_arr, nodata=-9999.0)
+
+        assert raster._host_materialized is False
+
+        mask = raster.nodata_mask
+        assert mask[0, 1]
+        assert mask[1, 1]
+        assert not mask[0, 0]
+        assert not mask[1, 0]
+
+    @requires_gpu
+    def test_nan_nodata_from_device(self):
+        """nodata_mask on device-resident raster with NaN nodata."""
+        import cupy as cp
+
+        data_np = np.array([[1.0, np.nan], [np.nan, 4.0]], dtype=np.float64)
+        device_arr = cp.asarray(data_np)
+        raster = from_device(device_arr, nodata=np.nan)
+
+        assert raster._host_materialized is False
+
+        mask = raster.nodata_mask
+        expected = np.array([[False, True], [True, False]])
+        np.testing.assert_array_equal(mask, expected)
+
+    @requires_gpu
+    def test_no_nodata_from_device(self):
+        """nodata_mask on device-resident raster with nodata=None returns all-False."""
+        import cupy as cp
+
+        device_arr = cp.ones((3, 4), dtype=np.float32)
+        raster = from_device(device_arr)
+
+        assert raster._host_materialized is False
+
+        mask = raster.nodata_mask
+        assert not mask.any()
+        assert mask.shape == (3, 4)
+
+    @requires_gpu
+    def test_valid_mask_from_device(self):
+        """valid_mask delegates to nodata_mask, so it also must be correct."""
+        import cupy as cp
+
+        data_np = np.array([[1, -9999, 3], [-9999, 5, -9999]], dtype=np.int32)
+        device_arr = cp.asarray(data_np)
+        raster = from_device(device_arr, nodata=-9999)
+
+        assert raster._host_materialized is False
+
+        valid = raster.valid_mask
+        expected = np.array([[True, False, True], [False, True, False]])
+        np.testing.assert_array_equal(valid, expected)
+
+    @requires_gpu
+    def test_nodata_mask_does_not_change_residency(self):
+        """Accessing nodata_mask should not flip residency to HOST."""
+        import cupy as cp
+
+        device_arr = cp.ones((4, 5), dtype=np.float32)
+        raster = from_device(device_arr, nodata=-1.0)
+
+        _ = raster.nodata_mask
+        # _ensure_host_state syncs host data but should not change
+        # the declared residency (the raster is still conceptually
+        # device-resident -- the host sync is an internal detail).
+        assert raster.residency is Residency.DEVICE
+
+    @requires_gpu
+    def test_nodata_mask_host_materialized_after_access(self):
+        """After nodata_mask access, host data should be materialized."""
+        import cupy as cp
+
+        data_np = np.array([[10, 20], [30, 40]], dtype=np.int16)
+        device_arr = cp.asarray(data_np)
+        raster = from_device(device_arr, nodata=20)
+
+        assert raster._host_materialized is False
+        _ = raster.nodata_mask
+        assert raster._host_materialized is True
+        # Subsequent to_numpy should return correct data without another transfer
+        np.testing.assert_array_equal(raster.to_numpy(), data_np)
+
+
+# ---------------------------------------------------------------------------
 # Bounds
 # ---------------------------------------------------------------------------
 

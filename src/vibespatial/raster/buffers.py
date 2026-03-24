@@ -275,7 +275,17 @@ class OwnedRasterArray:
 
     @property
     def nodata_mask(self) -> np.ndarray:
-        """Boolean mask where True means nodata (invalid pixel)."""
+        """Boolean mask where True means nodata (invalid pixel).
+
+        For device-resident rasters whose host data has not been synced,
+        this materializes host data first so the mask is computed from
+        actual pixel values rather than uninitialized memory.
+        """
+        # Ensure host data is up-to-date before reading self.data.
+        # This is a no-op when _host_materialized is already True (the
+        # common case for HOST-resident rasters created via from_numpy).
+        self._ensure_host_state()
+
         if self.nodata is None:
             return np.zeros(self.data.shape, dtype=bool)
         if np.isnan(self.nodata):
