@@ -526,3 +526,109 @@ class TestPolygonizeGPU:
         for g in geoms:
             assert g.is_valid
             assert not g.is_empty
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for bug #17: pad_value collision with real data values
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+class TestPolygonizePadValueCollision:
+    """Verify GPU polygonize pad_value sentinel never collides with real data values."""
+
+    @requires_gpu
+    def test_data_with_neg_inf_no_nodata(self):
+        """Data containing -inf should not lose any real values to pad filtering."""
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        data = np.array(
+            [
+                [-np.inf, -np.inf, 1.0, 1.0],
+                [-np.inf, -np.inf, 1.0, 1.0],
+                [2.0, 2.0, 2.0, 2.0],
+                [2.0, 2.0, 2.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+        geoms, vals = polygonize_gpu(raster)
+        value_set = set(vals)
+        assert 1.0 in value_set, "value 1.0 missing from polygonize output"
+        assert 2.0 in value_set, "value 2.0 missing from polygonize output"
+        assert -np.inf in value_set, "-inf value was incorrectly filtered by pad_value collision"
+
+    @requires_gpu
+    def test_data_with_neg_max_float64_no_nodata(self):
+        """Data containing -sys.float_info.max should not collide with pad_value."""
+        import sys
+
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        neg_max = -sys.float_info.max
+        data = np.array(
+            [
+                [neg_max, neg_max, 1.0, 1.0],
+                [neg_max, neg_max, 1.0, 1.0],
+                [2.0, 2.0, 2.0, 2.0],
+                [2.0, 2.0, 2.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+        geoms, vals = polygonize_gpu(raster)
+        value_set = set(vals)
+        assert neg_max in value_set, (
+            "-sys.float_info.max was incorrectly filtered by pad_value collision"
+        )
+
+    @requires_gpu
+    def test_data_with_nan_nodata(self):
+        """NaN-nodata raster should polygonize correctly with NaN pad sentinel."""
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        data = np.array(
+            [
+                [1.0, 1.0, np.nan],
+                [1.0, 1.0, np.nan],
+                [2.0, 2.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        geoms, vals = polygonize_gpu(raster)
+        value_set = set(vals)
+        assert 1.0 in value_set, "value 1.0 missing"
+        assert 2.0 in value_set, "value 2.0 missing"
+        for v in vals:
+            assert not np.isnan(v), "NaN nodata leaked into polygon values"
+
+    @requires_gpu
+    def test_no_nodata_normal_range(self):
+        """Raster with no nodata and normal-range values should work correctly."""
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        data = np.array(
+            [
+                [10.0, 10.0, 20.0, 20.0],
+                [10.0, 10.0, 20.0, 20.0],
+                [30.0, 30.0, 30.0, 30.0],
+                [30.0, 30.0, 30.0, 30.0],
+            ],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+        geoms, vals = polygonize_gpu(raster)
+        value_set = set(vals)
+        assert {10.0, 20.0, 30.0} == value_set
+
+    @requires_gpu
+    def test_all_same_extreme_value(self):
+        """Uniform raster at -inf should produce exactly one polygon."""
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        data = np.full((4, 4), -np.inf, dtype=np.float64)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+        geoms, vals = polygonize_gpu(raster)
+        assert len(geoms) >= 1, "uniform -inf raster should produce at least one polygon"
+        assert all(v == -np.inf for v in vals), "all polygon values should be -inf"

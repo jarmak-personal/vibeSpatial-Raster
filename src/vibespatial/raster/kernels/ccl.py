@@ -94,7 +94,7 @@ void local_merge_4c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -105,7 +105,7 @@ void local_merge_4c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -170,7 +170,7 @@ void local_merge_8c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -182,7 +182,7 @@ void local_merge_8c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -194,7 +194,7 @@ void local_merge_8c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -206,7 +206,7 @@ void local_merge_8c(
             int n_root = find_root(labels, nidx);
             if (n_root != my_root) {
                 union_roots(labels, my_root, n_root);
-                *changed = 1;
+                atomicOr(changed, 1);
                 my_root = find_root(labels, idx);
             }
         }
@@ -244,7 +244,7 @@ void pointer_jump(
         }
         if (root != label) {
             labels[idx] = root;
-            *changed = 1;
+            atomicOr(changed, 1);
         }
     }
 }

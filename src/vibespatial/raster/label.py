@@ -17,6 +17,7 @@ from vibespatial.raster.buffers import (
     OwnedRasterArray,
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
+    from_device,
     from_numpy,
 )
 from vibespatial.residency import Residency, TransferTrigger
@@ -1476,6 +1477,199 @@ def _morphology_cpu(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Top-hat / black-hat difference helpers (GPU + CPU)
+# ---------------------------------------------------------------------------
+
+
+def _tophat_diff_gpu(
+    raster: OwnedRasterArray,
+    opened: OwnedRasterArray,
+) -> OwnedRasterArray:
+    """Compute tophat = original & ~opened on device via CuPy."""
+    import cupy as cp
+
+    t0 = time.perf_counter()
+
+    # Move both to device; opened may already be HOST after morphology_gpu
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+    opened.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+
+    d_orig = raster.device_data()
+    if d_orig.ndim == 3:
+        d_orig = d_orig[0]
+    d_opened = opened.device_data()
+    if d_opened.ndim == 3:
+        d_opened = d_opened[0]
+
+    # Binary foreground mask for original (excluding nodata)
+    orig_bin = (d_orig != 0).astype(cp.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~cp.isnan(d_orig)).astype(cp.uint8)
+        else:
+            orig_bin &= (d_orig != raster.nodata).astype(cp.uint8)
+
+    opened_bin = (d_opened != 0).astype(cp.uint8)
+    tophat_data = (orig_bin & ~opened_bin).astype(cp.uint8)
+
+    elapsed = time.perf_counter() - t0
+    result = from_device(
+        tophat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"morphology_tophat_gpu (original - opening) elapsed={elapsed:.4f}s",
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def _tophat_diff_cpu(
+    raster: OwnedRasterArray,
+    opened: OwnedRasterArray,
+) -> OwnedRasterArray:
+    """Compute tophat = original & ~opened on host via NumPy."""
+    t0 = time.perf_counter()
+
+    original_data = raster.to_numpy()
+    if original_data.ndim == 3:
+        original_data = original_data[0]
+    opened_data = opened.to_numpy()
+    if opened_data.ndim == 3:
+        opened_data = opened_data[0]
+
+    orig_bin = (original_data != 0).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
+        else:
+            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
+
+    opened_bin = (opened_data != 0).astype(np.uint8)
+    tophat_data = (orig_bin & ~opened_bin).astype(np.uint8)
+
+    elapsed = time.perf_counter() - t0
+    result = from_numpy(
+        tophat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"morphology_tophat_cpu (original - opening) elapsed={elapsed:.4f}s",
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def _blackhat_diff_gpu(
+    raster: OwnedRasterArray,
+    closed: OwnedRasterArray,
+) -> OwnedRasterArray:
+    """Compute blackhat = closed & ~original on device via CuPy."""
+    import cupy as cp
+
+    t0 = time.perf_counter()
+
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+    closed.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+
+    d_orig = raster.device_data()
+    if d_orig.ndim == 3:
+        d_orig = d_orig[0]
+    d_closed = closed.device_data()
+    if d_closed.ndim == 3:
+        d_closed = d_closed[0]
+
+    orig_bin = (d_orig != 0).astype(cp.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~cp.isnan(d_orig)).astype(cp.uint8)
+        else:
+            orig_bin &= (d_orig != raster.nodata).astype(cp.uint8)
+
+    closed_bin = (d_closed != 0).astype(cp.uint8)
+    blackhat_data = (closed_bin & ~orig_bin).astype(cp.uint8)
+
+    elapsed = time.perf_counter() - t0
+    result = from_device(
+        blackhat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"morphology_blackhat_gpu (closing - original) elapsed={elapsed:.4f}s",
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def _blackhat_diff_cpu(
+    raster: OwnedRasterArray,
+    closed: OwnedRasterArray,
+) -> OwnedRasterArray:
+    """Compute blackhat = closed & ~original on host via NumPy."""
+    t0 = time.perf_counter()
+
+    original_data = raster.to_numpy()
+    if original_data.ndim == 3:
+        original_data = original_data[0]
+    closed_data = closed.to_numpy()
+    if closed_data.ndim == 3:
+        closed_data = closed_data[0]
+
+    orig_bin = (original_data != 0).astype(np.uint8)
+    if raster.nodata is not None:
+        if np.isnan(raster.nodata):
+            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
+        else:
+            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
+
+    closed_bin = (closed_data != 0).astype(np.uint8)
+    blackhat_data = (closed_bin & ~orig_bin).astype(np.uint8)
+
+    elapsed = time.perf_counter() - t0
+    result = from_numpy(
+        blackhat_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"morphology_blackhat_cpu (closing - original) elapsed={elapsed:.4f}s",
+            residency=result.residency,
+        )
+    )
+    return result
+
+
 def raster_morphology_tophat(
     raster: OwnedRasterArray,
     structuring_element: np.ndarray | None = None,
@@ -1503,6 +1697,11 @@ def raster_morphology_tophat(
     OwnedRasterArray
         Pixels that were removed by opening (bright detail).
     """
+    if use_gpu is None:
+        resolved_gpu = _should_use_gpu(raster)
+    else:
+        resolved_gpu = use_gpu
+
     opened = raster_morphology(
         raster,
         "open",
@@ -1511,37 +1710,10 @@ def raster_morphology_tophat(
         use_gpu=use_gpu,
     )
     # Top-hat = original - opened (binary: foreground in original but not in opened)
-    original_data = raster.to_numpy()
-    if original_data.ndim == 3:
-        original_data = original_data[0]
-    opened_data = opened.to_numpy()
-    if opened_data.ndim == 3:
-        opened_data = opened_data[0]
-
-    # Binary: original foreground minus opened foreground
-    orig_bin = (original_data != 0).astype(np.uint8)
-    if raster.nodata is not None:
-        if np.isnan(raster.nodata):
-            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
-        else:
-            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
-
-    opened_bin = (opened_data != 0).astype(np.uint8)
-    tophat_data = (orig_bin & ~opened_bin).astype(np.uint8)
-
-    result = from_numpy(
-        tophat_data,
-        nodata=raster.nodata,
-        affine=raster.affine,
-        crs=raster.crs,
-    )
-    result.diagnostics.append(
-        RasterDiagnosticEvent(
-            kind=RasterDiagnosticKind.RUNTIME,
-            detail="morphology_tophat (original - opening)",
-            residency=result.residency,
-        )
-    )
+    if resolved_gpu:
+        result = _tophat_diff_gpu(raster, opened)
+    else:
+        result = _tophat_diff_cpu(raster, opened)
     return result
 
 
@@ -1572,6 +1744,11 @@ def raster_morphology_blackhat(
     OwnedRasterArray
         Pixels that were added by closing (dark detail / holes filled).
     """
+    if use_gpu is None:
+        resolved_gpu = _should_use_gpu(raster)
+    else:
+        resolved_gpu = use_gpu
+
     closed = raster_morphology(
         raster,
         "close",
@@ -1580,34 +1757,8 @@ def raster_morphology_blackhat(
         use_gpu=use_gpu,
     )
     # Black-hat = closed - original
-    original_data = raster.to_numpy()
-    if original_data.ndim == 3:
-        original_data = original_data[0]
-    closed_data = closed.to_numpy()
-    if closed_data.ndim == 3:
-        closed_data = closed_data[0]
-
-    orig_bin = (original_data != 0).astype(np.uint8)
-    if raster.nodata is not None:
-        if np.isnan(raster.nodata):
-            orig_bin &= (~np.isnan(original_data)).astype(np.uint8)
-        else:
-            orig_bin &= (original_data != raster.nodata).astype(np.uint8)
-
-    closed_bin = (closed_data != 0).astype(np.uint8)
-    blackhat_data = (closed_bin & ~orig_bin).astype(np.uint8)
-
-    result = from_numpy(
-        blackhat_data,
-        nodata=raster.nodata,
-        affine=raster.affine,
-        crs=raster.crs,
-    )
-    result.diagnostics.append(
-        RasterDiagnosticEvent(
-            kind=RasterDiagnosticKind.RUNTIME,
-            detail="morphology_blackhat (closing - original)",
-            residency=result.residency,
-        )
-    )
+    if resolved_gpu:
+        result = _blackhat_diff_gpu(raster, closed)
+    else:
+        result = _blackhat_diff_cpu(raster, closed)
     return result

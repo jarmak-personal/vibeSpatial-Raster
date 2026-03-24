@@ -160,7 +160,7 @@ void fill_propagate(
 
     if (new_fill < my_fill) {{
         fill[idx] = new_fill;
-        *changed = 1;
+        atomicOr(changed, 1);
     }}
 
     #undef LOAD_FILL

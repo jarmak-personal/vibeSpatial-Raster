@@ -81,7 +81,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/algebra.py:864-873`
   - `sigma=0` causes division by zero in kernel computation, producing NaN kernel weights.
 
-- [ ] **17. Polygonize pad_value may collide with real data values**
+- [x] **17. Polygonize pad_value may collide with real data values**
   - `src/vibespatial/raster/polygonize.py:399-409`
   - `pad_value = min(data) - 1.0` could equal an actual data value at float64 extremes, causing that value to be silently excluded from polygonization.
 
@@ -96,17 +96,19 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - Every GPU function forces D->H at output. Any multi-stage pipeline (e.g., label -> sieve -> polygonize) bounces through host between every step. `from_device()` exists but is never used for return values.
   - Affected functions: `_binary_op`, `raster_apply`, `raster_where`, `raster_classify`, `_raster_expression_gpu`, `_gpu_convolve`, `_gpu_slope_aspect`, `_hillshade_gpu`, `_terrain_derivative_gpu`, `_focal_stat_gpu`, `label_gpu`, `morphology_gpu`, `_morphology_nxn_gpu`, `_sieve_gpu`, `_distance_transform_gpu`, `rasterize_gpu`, `_resample_gpu`, `_fill_sinks_gpu`, `_raster_histogram_equalize_gpu`.
 
-- [ ] **20. Multiple implicit syncs via `.size` instead of `.shape[0]`**
+- [x] **20. Multiple implicit syncs via `.size` instead of `.shape[0]`**
   - `histogram.py:250,406,424,385,452`
   - `.size` on CuPy arrays from boolean indexing forces sync. The zonal module already fixed this pattern.
 
-- [ ] **21. `raster_morphology_tophat/blackhat`: host-side difference computation**
+- [x] **21. `raster_morphology_tophat/blackhat`: host-side difference computation**
   - `src/vibespatial/raster/label.py:1510-1526, 1579-1594`
   - Pulls two GPU results to host just to compute a binary XOR.
+  - **Fixed:** Split difference computation into `_tophat_diff_gpu`/`_blackhat_diff_gpu` (CuPy on device, returns via `from_device()`) and `_tophat_diff_cpu`/`_blackhat_diff_cpu` (NumPy on host). GPU path uses `move_to(DEVICE)` + `device_data()` for both inputs, stays on device, and returns a DEVICE-resident raster.
 
-- [ ] **22. Non-atomic `*changed = 1` in hydrology/CCL kernels**
+- [x] **22. Non-atomic `*changed = 1` in hydrology/CCL kernels**
   - `kernels/hydrology.py:163`, `kernels/ccl.py:97,108,247`
   - Technically UB per CUDA memory model (benign in practice since all threads write the same 32-bit value).
+  - **Fixed:** replaced all `*changed = 1` with `atomicOr(changed, 1)` in both files.
 
 ---
 

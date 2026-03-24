@@ -262,7 +262,7 @@ def _raster_histogram_gpu_device(
     else:
         d_valid = d_flat
 
-    n_valid = int(d_valid.size)
+    n_valid = int(d_valid.shape[0])
     if n_valid == 0:
         return None
 
@@ -397,7 +397,7 @@ def _raster_histogram_equalize_gpu(
             d_valid_mask = ~d_mask
             d_flat = d_data.ravel()
             d_valid_idx = cp.flatnonzero(d_valid_mask.ravel())
-            if d_valid_idx.size == 0:
+            if d_valid_idx.shape[0] == 0:
                 host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
                 # Output is uint8; non-uint8 nodata mapped to 0
                 early_nodata = 0 if raster.nodata is not None else None
@@ -420,7 +420,7 @@ def _raster_histogram_equalize_gpu(
         d_u8 = d_data
 
     d_flat_u8 = d_u8.ravel()
-    n_pixels = int(d_flat_u8.size)
+    n_pixels = int(d_flat_u8.shape[0])
 
     # Build nodata mask for the remap kernel
     if raster.nodata is not None:
@@ -438,7 +438,7 @@ def _raster_histogram_equalize_gpu(
     else:
         d_valid_u8 = d_flat_u8
 
-    n_valid = int(d_valid_u8.size)
+    n_valid = int(d_valid_u8.shape[0])
     if n_valid == 0:
         host_result = cp.asnumpy(cp.zeros(original_shape, dtype=cp.uint8))
         # Output is uint8; for non-uint8 inputs, nodata pixels are at 0
@@ -477,7 +477,7 @@ def _raster_histogram_equalize_gpu(
 
     d_nonzero_mask = d_cdf > 0
     d_nonzero_indices = cp.flatnonzero(d_nonzero_mask)
-    if d_nonzero_indices.size > 0:
+    if d_nonzero_indices.shape[0] > 0:
         d_cdf_min = d_cdf[d_nonzero_indices[0]]
     else:
         d_cdf_min = cp.int64(0)

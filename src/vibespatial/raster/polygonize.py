@@ -399,14 +399,17 @@ def polygonize_gpu(
     if raster.nodata is not None and not np.isnan(raster.nodata):
         pad_value = float(raster.nodata)
     else:
-        # Use a value outside the data range (works even for NaN nodata).
-        # Compute on device; single scalar D2H is unavoidable for the branch.
-        d_finite = d_data_f64[cp.isfinite(d_data_f64)]
-        if d_finite.size > 0:
-            pad_value = float(d_finite.min().item())  # single scalar D2H
-            pad_value -= 1.0
-        else:
-            pad_value = 0.0
+        # Use NaN as the padding sentinel.  NaN is ideal because:
+        # 1. NaN != x is True for ALL x (including NaN itself), so the
+        #    safety filter ``d_unique[d_unique != pad_value]`` below
+        #    will never accidentally remove a real data value.
+        # 2. The kernel uses exact ``==`` comparison against the target value,
+        #    so NaN border pixels can never match any target.
+        # 3. Border pixels are already marked nodata=1 in d_nodata_mask,
+        #    providing double protection.
+        # This replaces the previous ``min(data) - 1.0`` approach which could
+        # collide with real values at float64 extremes (e.g., -inf, -max).
+        pad_value = np.nan
 
     # Pad on device: allocate padded buffer and copy interior via slice
     d_padded = cp.full((orig_height + 2, orig_width + 2), pad_value, dtype=cp.float64)
