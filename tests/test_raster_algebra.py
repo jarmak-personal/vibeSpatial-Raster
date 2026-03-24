@@ -308,6 +308,22 @@ class TestGaussianFilter:
         assert smoothed[5, 6] > 0.0
         assert smoothed[4, 5] > 0.0
 
+    def test_sigma_zero_raises(self):
+        from vibespatial.raster.algebra import raster_gaussian_filter
+        from vibespatial.raster.buffers import from_numpy
+
+        raster = from_numpy(np.ones((5, 5)))
+        with pytest.raises(ValueError, match="sigma must be positive"):
+            raster_gaussian_filter(raster, sigma=0)
+
+    def test_sigma_negative_raises(self):
+        from vibespatial.raster.algebra import raster_gaussian_filter
+        from vibespatial.raster.buffers import from_numpy
+
+        raster = from_numpy(np.ones((5, 5)))
+        with pytest.raises(ValueError, match="sigma must be positive"):
+            raster_gaussian_filter(raster, sigma=-1.5)
+
 
 class TestSlope:
     def test_flat(self):

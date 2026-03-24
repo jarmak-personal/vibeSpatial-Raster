@@ -871,10 +871,17 @@ def raster_gaussian_filter(
     raster : OwnedRasterArray
         Input raster.
     sigma : float
-        Standard deviation of the Gaussian.
+        Standard deviation of the Gaussian.  Must be positive.
     kernel_size : int or None
         Size of the kernel. Default: 2 * ceil(3*sigma) + 1.
+
+    Raises
+    ------
+    ValueError
+        If *sigma* is not positive.
     """
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
     if kernel_size is None:
         kernel_size = int(2 * np.ceil(3 * sigma) + 1)
     if kernel_size % 2 == 0:
