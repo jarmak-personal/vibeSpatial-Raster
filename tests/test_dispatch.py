@@ -1,15 +1,22 @@
-"""Tests for VRAM budget functions in vibespatial.raster.dispatch."""
+"""Tests for VRAM budget functions and band dispatch executors."""
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
+from vibespatial.raster.buffers import (
+    OwnedRasterArray,
+    RasterDiagnosticKind,
+    from_numpy,
+)
 from vibespatial.raster.dispatch import (
     _VRAM_HEADROOM_FRACTION,
     available_vram_bytes,
+    dispatch_per_band_cpu,
+    dispatch_per_band_gpu,
     max_bands_for_budget,
 )
 
@@ -169,6 +176,224 @@ class TestMaxBandsForBudget:
         ):
             result = max_bands_for_budget(1000, 1000, np.int16)
             assert result == 20
+
+
+# ---------------------------------------------------------------------------
+# dispatch_per_band_cpu — CPU band dispatch
+# ---------------------------------------------------------------------------
+
+# Shared test fixtures (inline, no conftest.py)
+
+_TEST_AFFINE = (10.0, 0.0, 100.0, 0.0, -10.0, 200.0)
+_TEST_NODATA = -9999.0
+
+
+def _make_single_band_raster(
+    height: int = 8,
+    width: int = 10,
+    dtype: np.dtype = np.float32,
+    nodata: float | int | None = _TEST_NODATA,
+    seed: int = 42,
+) -> OwnedRasterArray:
+    rng = np.random.default_rng(seed)
+    data = rng.random((height, width)).astype(dtype)
+    return from_numpy(data, nodata=nodata, affine=_TEST_AFFINE, crs=None)
+
+
+def _make_multiband_raster(
+    bands: int = 3,
+    height: int = 8,
+    width: int = 10,
+    dtype: np.dtype = np.float32,
+    nodata: float | int | None = _TEST_NODATA,
+    seed: int = 42,
+) -> OwnedRasterArray:
+    rng = np.random.default_rng(seed)
+    data = rng.random((bands, height, width)).astype(dtype)
+    return from_numpy(data, nodata=nodata, affine=_TEST_AFFINE, crs=None)
+
+
+def _double_op(raster: OwnedRasterArray) -> OwnedRasterArray:
+    """Simple test op: multiply pixel values by 2."""
+    return from_numpy(
+        raster.to_numpy() * 2,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+
+
+class TestDispatchPerBandCpuSingleBand:
+    def test_single_band_passthrough(self):
+        """Single-band raster: op_fn called once, result returned directly."""
+        raster = _make_single_band_raster()
+        result = dispatch_per_band_cpu(raster, _double_op)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 1
+
+    def test_single_band_call_count(self):
+        """op_fn called exactly once for a single-band raster."""
+        raster = _make_single_band_raster()
+        mock_op = MagicMock(side_effect=_double_op)
+        dispatch_per_band_cpu(raster, mock_op)
+        assert mock_op.call_count == 1
+
+    def test_single_band_diagnostic_event(self):
+        """Single-band passthrough appends a RUNTIME diagnostic event."""
+        raster = _make_single_band_raster()
+        result = dispatch_per_band_cpu(raster, _double_op)
+        runtime_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_events) >= 1
+        assert "dispatch_per_band_cpu" in runtime_events[-1].detail
+        assert "single-band" in runtime_events[-1].detail
+
+
+class TestDispatchPerBandCpuMultiband:
+    def test_multiband_3_bands(self):
+        """All 3 bands processed correctly, output shape (3, H, W)."""
+        raster = _make_multiband_raster(bands=3)
+        result = dispatch_per_band_cpu(raster, _double_op)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 3
+        assert result.to_numpy().shape == (3, 8, 10)
+
+    def test_multiband_call_count(self):
+        """op_fn called exactly N times for N bands."""
+        n_bands = 5
+        raster = _make_multiband_raster(bands=n_bands)
+        mock_op = MagicMock(side_effect=_double_op)
+        dispatch_per_band_cpu(raster, mock_op)
+        assert mock_op.call_count == n_bands
+
+    def test_multiband_preserves_metadata(self):
+        """Affine, CRS, nodata, and dtype propagated to result."""
+        raster = _make_multiband_raster(bands=3, dtype=np.float32)
+        result = dispatch_per_band_cpu(raster, _double_op)
+        assert result.affine == _TEST_AFFINE
+        assert result.crs is None
+        assert result.nodata == _TEST_NODATA
+        assert result.dtype == np.float32
+
+    def test_multiband_diagnostic_event(self):
+        """Multiband dispatch appends a RUNTIME diagnostic with band count."""
+        raster = _make_multiband_raster(bands=3)
+        result = dispatch_per_band_cpu(raster, _double_op)
+        runtime_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_events) >= 1
+        last = runtime_events[-1]
+        assert "dispatch_per_band_cpu" in last.detail
+        assert "bands=3" in last.detail
+
+    def test_multiband_2_bands(self):
+        """Edge case: 2-band raster."""
+        raster = _make_multiband_raster(bands=2)
+        result = dispatch_per_band_cpu(raster, _double_op)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 2
+
+    def test_multiband_nodata_preserved(self):
+        """Nodata pixels remain nodata after per-band dispatch."""
+        raster = _make_multiband_raster(bands=2)
+        # Inject nodata into known positions
+        data = raster.to_numpy().copy()
+        data[0, 0, 0] = _TEST_NODATA
+        data[1, 3, 4] = _TEST_NODATA
+        raster_with_nd = from_numpy(data, nodata=_TEST_NODATA, affine=_TEST_AFFINE, crs=None)
+
+        def identity_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(r.to_numpy().copy(), nodata=r.nodata, affine=r.affine, crs=r.crs)
+
+        result = dispatch_per_band_cpu(raster_with_nd, identity_op)
+        result_data = result.to_numpy()
+        assert result_data[0, 0, 0] == _TEST_NODATA
+        assert result_data[1, 3, 4] == _TEST_NODATA
+
+
+# ---------------------------------------------------------------------------
+# dispatch_per_band_gpu — GPU band dispatch (CPU-backed tests where possible)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchPerBandGpuSingleBand:
+    @gpu
+    def test_single_band_passthrough(self):
+        """Single-band raster: op_fn called once on GPU path."""
+        raster = _make_single_band_raster()
+        result = dispatch_per_band_gpu(raster, _double_op)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 1
+
+    @gpu
+    def test_single_band_call_count(self):
+        """op_fn called exactly once for a single-band raster."""
+        raster = _make_single_band_raster()
+        mock_op = MagicMock(side_effect=_double_op)
+        dispatch_per_band_gpu(raster, mock_op)
+        assert mock_op.call_count == 1
+
+    @gpu
+    def test_single_band_diagnostic_event(self):
+        """Single-band GPU passthrough appends a RUNTIME diagnostic."""
+        raster = _make_single_band_raster()
+        result = dispatch_per_band_gpu(raster, _double_op)
+        runtime_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_events) >= 1
+        assert "dispatch_per_band_gpu" in runtime_events[-1].detail
+        assert "single-band" in runtime_events[-1].detail
+
+
+class TestDispatchPerBandGpuMultiband:
+    @gpu
+    def test_multiband_3_bands(self):
+        """All 3 bands processed, correct output shape (3, H, W)."""
+        raster = _make_multiband_raster(bands=3)
+        result = dispatch_per_band_gpu(raster, _double_op)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 3
+        assert result.to_numpy().shape == (3, 8, 10)
+
+    @gpu
+    def test_multiband_call_count(self):
+        """op_fn called exactly N times for N bands."""
+        n_bands = 4
+        raster = _make_multiband_raster(bands=n_bands)
+        mock_op = MagicMock(side_effect=_double_op)
+        dispatch_per_band_gpu(raster, mock_op)
+        assert mock_op.call_count == n_bands
+
+    @gpu
+    def test_multiband_preserves_metadata(self):
+        """Affine, CRS, nodata, and dtype propagated to GPU result."""
+        raster = _make_multiband_raster(bands=3, dtype=np.float32)
+        result = dispatch_per_band_gpu(raster, _double_op)
+        assert result.affine == _TEST_AFFINE
+        assert result.crs is None
+        assert result.nodata == _TEST_NODATA
+        assert result.dtype == np.float32
+
+    @gpu
+    def test_multiband_diagnostic_event(self):
+        """Multiband GPU dispatch appends a RUNTIME diagnostic."""
+        raster = _make_multiband_raster(bands=3)
+        result = dispatch_per_band_gpu(raster, _double_op)
+        runtime_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_events) >= 1
+        last = runtime_events[-1]
+        assert "dispatch_per_band_gpu" in last.detail
+        assert "bands=3" in last.detail
+
+    @gpu
+    def test_gpu_cpu_parity(self):
+        """GPU and CPU per-band dispatch produce the same result."""
+        raster = _make_multiband_raster(bands=3)
+        result_gpu = dispatch_per_band_gpu(raster, _double_op)
+        result_cpu = dispatch_per_band_cpu(raster, _double_op)
+        np.testing.assert_allclose(result_gpu.to_numpy(), result_cpu.to_numpy(), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
