@@ -3388,3 +3388,159 @@ def raster_focal_variety(
     if use_gpu:
         return _focal_stat_gpu(raster, "variety", radius_y, radius_x)
     return _focal_stat_cpu(raster, "variety", radius_y, radius_x)
+
+
+# ---------------------------------------------------------------------------
+# Spectral index convenience functions
+# ---------------------------------------------------------------------------
+
+
+def raster_ndvi(
+    raster: OwnedRasterArray,
+    *,
+    nir_band: int = 4,
+    red_band: int = 3,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Normalized Difference Vegetation Index: (NIR - RED) / (NIR + RED).
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Multiband raster containing NIR and RED bands.
+    nir_band : int
+        1-indexed band number for the NIR band (default 4, Landsat/Sentinel-2
+        convention).
+    red_band : int
+        1-indexed band number for the RED band (default 3).
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Single-band raster with NDVI values in [-1, 1].  Pixels where
+        NIR + RED == 0 are set to nodata.
+
+    Raises
+    ------
+    ValueError
+        If band indices are less than 1.
+    IndexError
+        If band indices exceed the raster's band count.
+    """
+    if nir_band < 1:
+        raise ValueError(f"nir_band must be >= 1 (1-indexed), got {nir_band}")
+    if red_band < 1:
+        raise ValueError(f"red_band must be >= 1 (1-indexed), got {red_band}")
+
+    # Convert 1-indexed (rasterio convention) to 0-indexed for expression engine
+    nir_idx = nir_band - 1
+    red_idx = red_band - 1
+
+    # Validate band indices against raster band count
+    for idx, label in ((nir_idx, "nir_band"), (red_idx, "red_band")):
+        if idx >= raster.band_count:
+            raise IndexError(
+                f"{label}={idx + 1} (0-indexed: {idx}) exceeds raster band "
+                f"count of {raster.band_count}"
+            )
+
+    expr = f"(a[{nir_idx}] - a[{red_idx}]) / (a[{nir_idx}] + a[{red_idx}])"
+    return raster_expression(expr, a=raster, use_gpu=use_gpu)
+
+
+def raster_band_ratio(
+    raster: OwnedRasterArray,
+    *,
+    band_a: int,
+    band_b: int,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Generic band ratio: band_a / band_b.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Multiband raster.
+    band_a : int
+        1-indexed band number for the numerator.
+    band_b : int
+        1-indexed band number for the denominator.
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Single-band raster with the ratio values.  Pixels where band_b == 0
+        are set to nodata.
+
+    Raises
+    ------
+    ValueError
+        If band indices are less than 1.
+    IndexError
+        If band indices exceed the raster's band count.
+    """
+    if band_a < 1:
+        raise ValueError(f"band_a must be >= 1 (1-indexed), got {band_a}")
+    if band_b < 1:
+        raise ValueError(f"band_b must be >= 1 (1-indexed), got {band_b}")
+
+    idx_a = band_a - 1
+    idx_b = band_b - 1
+
+    for idx, label in ((idx_a, "band_a"), (idx_b, "band_b")):
+        if idx >= raster.band_count:
+            raise IndexError(
+                f"{label}={idx + 1} (0-indexed: {idx}) exceeds raster band "
+                f"count of {raster.band_count}"
+            )
+
+    expr = f"a[{idx_a}] / a[{idx_b}]"
+    return raster_expression(expr, a=raster, use_gpu=use_gpu)
+
+
+def raster_band_math(
+    raster: OwnedRasterArray,
+    expression: str,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Arbitrary band math on a multiband raster.
+
+    The expression uses 0-indexed band references with the variable ``b``:
+    ``b[0]``, ``b[1]``, etc.  This is a thin wrapper around
+    :func:`raster_expression` that binds the input raster as variable ``b``.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Multiband raster.
+    expression : str
+        Arithmetic expression using ``b[N]`` band references (0-indexed).
+        Supported operators: ``+``, ``-``, ``*``, ``/``.
+        Supported functions: ``abs``, ``sqrt``, ``pow``, ``min``, ``max``,
+        ``clamp``, ``log``, ``log2``, ``log10``, ``exp``, ``sin``, ``cos``,
+        ``tan``, ``floor``, ``ceil``.
+
+        Example: ``"(b[3] - b[2]) / (b[3] + b[2] + 0.5 * b[1])"``
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Single-band raster with the computed result.
+
+    Raises
+    ------
+    ValueError
+        If the expression is empty or contains invalid tokens.
+    IndexError
+        If a band index exceeds the raster's band count.
+    """
+    if not expression or not expression.strip():
+        raise ValueError("expression must not be empty")
+    return raster_expression(expression, b=raster, use_gpu=use_gpu)
