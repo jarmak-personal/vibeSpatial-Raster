@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 
 import numpy as np
 
@@ -23,6 +24,17 @@ from vibespatial.raster.buffers import (
 from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_multiband_squeeze(arr, *, stacklevel: int = 3):
+    """Emit a UserWarning when silently discarding extra bands from a 3D array."""
+    if arr.shape[0] > 1:
+        warnings.warn(
+            f"Multiband raster with {arr.shape[0]} bands received; "
+            "only band 1 will be processed. Multiband support is planned.",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +297,7 @@ def label_gpu(
 
     # Squeeze band dimension if 3D -> get a 2D view for the ravel below
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     # Build foreground mask entirely on device
@@ -596,6 +609,7 @@ def morphology_gpu(
     )
     d_data = raster.device_data()
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -789,6 +803,7 @@ def _morphology_nxn_gpu(
     )
     d_data = raster.device_data()
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1191,6 +1206,7 @@ def _sieve_cpu(
     """CPU sieve filter using numpy unique/bincount."""
     data = labeled.to_numpy().copy()
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     unique_labels, counts = np.unique(data, return_counts=True)
@@ -1442,6 +1458,7 @@ def _morphology_cpu(
 
     data = raster.to_numpy()
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     binary = data != 0
@@ -1503,10 +1520,11 @@ def _tophat_diff_gpu(
 
     d_orig = raster.device_data()
     if d_orig.ndim == 3:
+        _warn_multiband_squeeze(d_orig)
         d_orig = d_orig[0]
     d_opened = opened.device_data()
     if d_opened.ndim == 3:
-        d_opened = d_opened[0]
+        d_opened = d_opened[0]  # follows primary squeeze above
 
     # Binary foreground mask for original (excluding nodata)
     orig_bin = (d_orig != 0).astype(cp.uint8)
@@ -1545,10 +1563,11 @@ def _tophat_diff_cpu(
 
     original_data = raster.to_numpy()
     if original_data.ndim == 3:
+        _warn_multiband_squeeze(original_data)
         original_data = original_data[0]
     opened_data = opened.to_numpy()
     if opened_data.ndim == 3:
-        opened_data = opened_data[0]
+        opened_data = opened_data[0]  # follows primary squeeze above
 
     orig_bin = (original_data != 0).astype(np.uint8)
     if raster.nodata is not None:
@@ -1597,10 +1616,11 @@ def _blackhat_diff_gpu(
 
     d_orig = raster.device_data()
     if d_orig.ndim == 3:
+        _warn_multiband_squeeze(d_orig)
         d_orig = d_orig[0]
     d_closed = closed.device_data()
     if d_closed.ndim == 3:
-        d_closed = d_closed[0]
+        d_closed = d_closed[0]  # follows primary squeeze above
 
     orig_bin = (d_orig != 0).astype(cp.uint8)
     if raster.nodata is not None:
@@ -1638,10 +1658,11 @@ def _blackhat_diff_cpu(
 
     original_data = raster.to_numpy()
     if original_data.ndim == 3:
+        _warn_multiband_squeeze(original_data)
         original_data = original_data[0]
     closed_data = closed.to_numpy()
     if closed_data.ndim == 3:
-        closed_data = closed_data[0]
+        closed_data = closed_data[0]  # follows primary squeeze above
 
     orig_bin = (original_data != 0).astype(np.uint8)
     if raster.nodata is not None:

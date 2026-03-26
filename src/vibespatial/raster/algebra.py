@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import time
+import warnings
 
 import numpy as np
 
@@ -27,6 +28,22 @@ from vibespatial.residency import Residency, TransferTrigger
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _warn_multiband_squeeze(arr, *, stacklevel: int = 3):
+    """Emit a UserWarning when silently discarding extra bands from a 3D array.
+
+    Call this *before* squeezing ``arr = arr[0]``.  ``stacklevel`` should point
+    the warning back to the caller's caller (the public dispatch function).
+    Only warns when there are genuinely multiple bands (shape[0] > 1).
+    """
+    if arr.shape[0] > 1:
+        warnings.warn(
+            f"Multiband raster with {arr.shape[0]} bands received; "
+            "only band 1 will be processed. Multiband support is planned.",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 def _has_cupy() -> bool:
@@ -398,6 +415,7 @@ def _raster_expression_gpu(
         )
         d = r.device_data()
         if d.ndim == 3:
+            _warn_multiband_squeeze(d, stacklevel=4)
             d = d[0]
         d = d.astype(compute_dtype, copy=False)
         _device_refs.append(d)
@@ -408,7 +426,7 @@ def _raster_expression_gpu(
         if mask is not None:
             m = mask.astype(cp.uint8, copy=False)
             if m.ndim == 3:
-                m = m[0]
+                m = m[0]  # follows data squeeze above
             _device_refs.append(m)
             mask_ptrs.append(m.data.ptr)
         else:
@@ -552,6 +570,7 @@ def _raster_expression_cpu(
         r = rasters[name]
         data = r.to_numpy().astype(compute_dtype)
         if data.ndim == 3:
+            _warn_multiband_squeeze(data, stacklevel=4)
             data = data[0]
         eval_ns[name] = data
         if r.nodata is not None:
@@ -727,6 +746,7 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
     # Move to device and cast to float64 for computation
     d_data = _to_device_data(raster).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -908,6 +928,7 @@ def _cpu_slope_aspect(
     """
     data = dem.to_numpy()
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     data = data.astype(np.float64)
@@ -1016,6 +1037,7 @@ def _gpu_slope_aspect(
     # Keep data on device -- no to_numpy() round-trip
     d_data = _to_device_data(dem).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1253,6 +1275,7 @@ def _hillshade_cpu(
     """CPU hillshade using Horn method (numpy)."""
     data = dem.to_numpy().astype(np.float64)
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     height, width = data.shape
@@ -1357,6 +1380,7 @@ def _hillshade_gpu(
     if d_data.dtype != cp.float64:
         d_data = d_data.astype(cp.float64, copy=False)
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1572,6 +1596,7 @@ def _terrain_derivative_gpu(
     )
     d_data = dem.device_data().astype(cp.float64, copy=False)
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1852,11 +1877,12 @@ def _focal_stat_cpu(
     """CPU fallback for a single focal statistic."""
     data = raster.to_numpy()
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     nodata_mask = raster.nodata_mask if raster.nodata is not None else None
     if nodata_mask is not None and nodata_mask.ndim == 3:
-        nodata_mask = nodata_mask[0]
+        nodata_mask = nodata_mask[0]  # follows data squeeze above
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     fn = _CPU_DISPATCH[stat_name]
@@ -1920,6 +1946,7 @@ def _focal_stat_gpu(
     # Move to device, cast to float64 for kernel computation
     d_data = _to_device_data(raster).astype(cp.float64, copy=False)
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1931,7 +1958,7 @@ def _focal_stat_gpu(
     if raster.nodata is not None:
         d_nodata = raster.device_nodata_mask()
         if d_nodata.ndim == 3:
-            d_nodata = d_nodata[0]
+            d_nodata = d_nodata[0]  # follows data squeeze above
         d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
@@ -2018,6 +2045,7 @@ def _terrain_derivative_cpu(
     """
     data = dem.to_numpy().astype(np.float64)
     if data.ndim == 3:
+        _warn_multiband_squeeze(data)
         data = data[0]
 
     height, width = data.shape

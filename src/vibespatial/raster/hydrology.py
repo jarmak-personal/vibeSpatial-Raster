@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 
 import numpy as np
 
@@ -26,6 +27,17 @@ from vibespatial.raster.buffers import (
 from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_multiband_squeeze(arr, *, stacklevel: int = 3):
+    """Emit a UserWarning when silently discarding extra bands from a 3D array."""
+    if arr.shape[0] > 1:
+        warnings.warn(
+            f"Multiband raster with {arr.shape[0]} bands received; "
+            "only band 1 will be processed. Multiband support is planned.",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +292,7 @@ def _fill_sinks_gpu(
 
     # Squeeze band dimension if 3D -> 2D view
     if d_data.ndim == 3:
+        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     # Determine working dtype for CUDA kernel
