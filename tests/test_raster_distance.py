@@ -196,12 +196,57 @@ class TestDistanceTransformCPU:
         assert dist.ndim == 2
         assert dist[1, 1] == 0.0
 
-    def test_multiband_raises(self):
-        """Multi-band raster should raise ValueError."""
-        data = np.zeros((2, 3, 3), dtype=np.int32)
+    def test_distance_multiband_3band(self):
+        """3-band binary mask should produce output with shape (3, H, W)."""
+        rng = np.random.default_rng(42)
+        data = np.zeros((3, 10, 12), dtype=np.int32)
+        data[0, 3, 5] = 1
+        data[1, 7, 2] = 1
+        data[1, 1, 9] = 1
+        data[2] = (rng.random((10, 12)) > 0.7).astype(np.int32)
+
         raster = from_numpy(data)
-        with pytest.raises(ValueError, match="single-band"):
-            raster_distance_transform(raster, use_gpu=False)
+        result = raster_distance_transform(raster, use_gpu=False)
+        out = result.to_numpy()
+
+        # Output shape must match input band count
+        assert out.ndim == 3
+        assert out.shape == (3, 10, 12)
+        # Output dtype is float64 (distance transform always produces float64)
+        assert out.dtype == np.float64
+        # Foreground pixels have distance 0
+        assert out[0, 3, 5] == 0.0
+        assert out[1, 7, 2] == 0.0
+        assert out[1, 1, 9] == 0.0
+        # Background pixels have positive distance (band 0 has one seed)
+        assert out[0, 0, 0] > 0.0
+        # Metadata preserved
+        assert result.affine == raster.affine
+        assert result.crs == raster.crs
+
+    def test_distance_multiband_per_band_match(self):
+        """Each band of multiband result must match single-band result."""
+        rng = np.random.default_rng(99)
+        data = np.zeros((3, 8, 10), dtype=np.float64)
+        data[0] = (rng.random((8, 10)) > 0.6).astype(np.float64)
+        data[1] = (rng.random((8, 10)) > 0.8).astype(np.float64)
+        data[2] = (rng.random((8, 10)) > 0.5).astype(np.float64)
+
+        multiband_raster = from_numpy(data)
+        multiband_result = raster_distance_transform(multiband_raster, use_gpu=False)
+        multiband_out = multiband_result.to_numpy()
+
+        # Process each band independently and compare
+        for band_idx in range(3):
+            single_raster = from_numpy(data[band_idx])
+            single_result = raster_distance_transform(single_raster, use_gpu=False)
+            single_out = single_result.to_numpy()
+            np.testing.assert_allclose(
+                multiband_out[band_idx],
+                single_out,
+                atol=1e-10,
+                err_msg=f"Band {band_idx} mismatch between multiband and single-band",
+            )
 
 
 # ---------------------------------------------------------------------------

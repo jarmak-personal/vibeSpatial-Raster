@@ -605,7 +605,7 @@ def raster_histogram(
     range_min: float | None = None,
     range_max: float | None = None,
     use_gpu: bool | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray] | list[tuple[np.ndarray, np.ndarray]]:
     """Compute histogram of raster pixel values.
 
     Nodata pixels are excluded from the histogram.
@@ -624,18 +624,54 @@ def raster_histogram(
     Returns
     -------
     tuple[np.ndarray, np.ndarray]
-        (counts, bin_edges) where counts has shape (bins,) and
-        bin_edges has shape (bins + 1,).
+        For single-band: ``(counts, bin_edges)`` where counts has shape
+        ``(bins,)`` and bin_edges has shape ``(bins + 1,)``.
+    list[tuple[np.ndarray, np.ndarray]]
+        For multiband: list of ``(counts, bin_edges)`` tuples, one per band.
     """
-    if raster.band_count != 1:
-        raise ValueError(
-            "raster_histogram requires a single-band raster. "
-            "For multiband, select a band first via indexing."
-        )
-
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
+    # -- Multiband: per-band dispatch --
+    if raster.band_count > 1:
+        from vibespatial.raster.dispatch import _single_band_view_cpu, _single_band_view_gpu
+
+        t0 = time.perf_counter()
+        results: list[tuple[np.ndarray, np.ndarray]] = []
+        for band_idx in range(raster.band_count):
+            if use_gpu:
+                from vibespatial.residency import TransferTrigger
+
+                raster.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="raster_histogram multiband: transfer to device",
+                )
+                band_view = _single_band_view_gpu(raster, band_idx)
+                counts, edges = _raster_histogram_gpu(band_view, bins, range_min, range_max)
+            else:
+                band_view = _single_band_view_cpu(raster, band_idx)
+                counts, edges = _raster_histogram_cpu(band_view, bins, range_min, range_max)
+            results.append((counts, edges))
+        elapsed = time.perf_counter() - t0
+
+        backend = "gpu" if use_gpu else "cpu"
+        raster.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=(
+                    f"raster_histogram {backend} multiband "
+                    f"bands={raster.band_count} pixels={raster.pixel_count} "
+                    f"bins={bins} elapsed={elapsed:.3f}s"
+                ),
+                residency=raster.residency,
+                visible_to_user=True,
+                elapsed_seconds=elapsed,
+            )
+        )
+        return results
+
+    # -- Single-band --
     t0 = time.perf_counter()
     if use_gpu:
         counts, edges = _raster_histogram_gpu(raster, bins, range_min, range_max)
@@ -740,6 +776,9 @@ def raster_histogram_equalize(
     distribution across the 0-255 range.  Output dtype is uint8.
     Nodata pixels are preserved.
 
+    For multiband rasters, each band is equalized independently and the
+    results are reassembled into a multiband ``OwnedRasterArray``.
+
     GPU pipeline: histogram (CCCL) -> CDF (CCCL exclusive_sum) ->
     LUT build (CuPy element-wise) -> remap kernel (NVRTC).
     All computation stays on-device until the final D2H transfer.
@@ -756,15 +795,37 @@ def raster_histogram_equalize(
     OwnedRasterArray
         Equalized raster with dtype uint8 and values in [0, 255].
     """
-    if raster.band_count != 1:
-        raise ValueError(
-            "raster_histogram_equalize requires a single-band raster. "
-            "For multiband, select a band first via indexing."
-        )
-
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
+    # -- Multiband: per-band dispatch via dispatch executors --
+    if raster.band_count > 1:
+        from vibespatial.raster.dispatch import dispatch_per_band_cpu, dispatch_per_band_gpu
+
+        t0 = time.perf_counter()
+        if use_gpu:
+            result = dispatch_per_band_gpu(raster, _raster_histogram_equalize_gpu)
+        else:
+            result = dispatch_per_band_cpu(raster, _raster_histogram_equalize_cpu)
+        elapsed = time.perf_counter() - t0
+
+        backend = "gpu" if use_gpu else "cpu"
+        result.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=(
+                    f"raster_histogram_equalize {backend} multiband "
+                    f"bands={raster.band_count} pixels={raster.pixel_count} "
+                    f"elapsed={elapsed:.3f}s"
+                ),
+                residency=result.residency,
+                visible_to_user=True,
+                elapsed_seconds=elapsed,
+            )
+        )
+        return result
+
+    # -- Single-band --
     t0 = time.perf_counter()
     if use_gpu:
         result = _raster_histogram_equalize_gpu(raster)
@@ -794,7 +855,7 @@ def raster_percentile(
     *,
     bins: int = 256,
     use_gpu: bool | None = None,
-) -> np.ndarray:
+) -> np.ndarray | list[np.ndarray]:
     """Compute percentile values from a raster using histogram-based CDF.
 
     Avoids a full sort by computing percentiles from the histogram CDF,
@@ -815,14 +876,11 @@ def raster_percentile(
     Returns
     -------
     np.ndarray
-        Array of percentile values with shape (len(percentiles),).
+        For single-band: array of percentile values with shape
+        ``(len(percentiles),)``.
+    list[np.ndarray]
+        For multiband: list of per-band percentile arrays, one per band.
     """
-    if raster.band_count != 1:
-        raise ValueError(
-            "raster_percentile requires a single-band raster. "
-            "For multiband, select a band first via indexing."
-        )
-
     if isinstance(percentiles, (int, float)):
         percentiles = [float(percentiles)]
     else:
@@ -835,6 +893,46 @@ def raster_percentile(
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
+    # -- Multiband: per-band dispatch --
+    if raster.band_count > 1:
+        from vibespatial.raster.dispatch import _single_band_view_cpu, _single_band_view_gpu
+
+        t0 = time.perf_counter()
+        results: list[np.ndarray] = []
+        for band_idx in range(raster.band_count):
+            if use_gpu:
+                from vibespatial.residency import TransferTrigger
+
+                raster.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="raster_percentile multiband: transfer to device",
+                )
+                band_view = _single_band_view_gpu(raster, band_idx)
+                band_pcts = _raster_percentile_gpu(band_view, percentiles, bins)
+            else:
+                band_view = _single_band_view_cpu(raster, band_idx)
+                band_pcts = _raster_percentile_cpu(band_view, percentiles, bins)
+            results.append(band_pcts)
+        elapsed = time.perf_counter() - t0
+
+        backend = "gpu" if use_gpu else "cpu"
+        raster.diagnostics.append(
+            RasterDiagnosticEvent(
+                kind=RasterDiagnosticKind.RUNTIME,
+                detail=(
+                    f"raster_percentile {backend} multiband "
+                    f"bands={raster.band_count} pixels={raster.pixel_count} "
+                    f"percentiles={percentiles} elapsed={elapsed:.3f}s"
+                ),
+                residency=raster.residency,
+                visible_to_user=True,
+                elapsed_seconds=elapsed,
+            )
+        )
+        return results
+
+    # -- Single-band --
     t0 = time.perf_counter()
     if use_gpu:
         result = _raster_percentile_gpu(raster, percentiles, bins)

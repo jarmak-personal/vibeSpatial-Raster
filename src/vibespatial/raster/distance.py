@@ -23,6 +23,7 @@ from vibespatial.raster.buffers import (
     from_device,
     from_numpy,
 )
+from vibespatial.raster.dispatch import dispatch_per_band_cpu, dispatch_per_band_gpu
 from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
@@ -71,14 +72,12 @@ def _next_power_of_2(n: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _distance_transform_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
-    """CPU Euclidean Distance Transform via scipy.ndimage."""
+def _distance_transform_cpu_single(raster: OwnedRasterArray) -> OwnedRasterArray:
+    """CPU Euclidean Distance Transform via scipy.ndimage (single-band)."""
     from scipy.ndimage import distance_transform_edt
 
     data = raster.to_numpy()
     if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("distance transform requires a single-band raster")
         data = data[0]
 
     # Build foreground mask (nonzero and non-nodata = foreground)
@@ -134,13 +133,20 @@ def _distance_transform_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     return result
 
 
+def _distance_transform_cpu(raster: OwnedRasterArray) -> OwnedRasterArray:
+    """CPU Euclidean Distance Transform with multiband dispatch."""
+    if raster.band_count > 1:
+        return dispatch_per_band_cpu(raster, _distance_transform_cpu_single)
+    return _distance_transform_cpu_single(raster)
+
+
 # ---------------------------------------------------------------------------
 # GPU: Euclidean Distance Transform via Jump Flooding Algorithm
 # ---------------------------------------------------------------------------
 
 
-def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
-    """GPU Euclidean Distance Transform using Jump Flooding Algorithm.
+def _distance_transform_gpu_single(raster: OwnedRasterArray) -> OwnedRasterArray:
+    """GPU Euclidean Distance Transform using Jump Flooding Algorithm (single-band).
 
     Three-phase NVRTC kernel pipeline:
     1. jfa_init: seed buffer initialization
@@ -184,8 +190,6 @@ def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
 
     # Squeeze band dimension if 3D
     if d_data.ndim == 3:
-        if d_data.shape[0] != 1:
-            raise ValueError("distance transform requires a single-band raster")
         d_data = d_data[0]
 
     # Build foreground mask entirely on device (nonzero and non-nodata = foreground)
@@ -407,6 +411,17 @@ def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
     return result
 
 
+def _distance_transform_gpu(raster: OwnedRasterArray) -> OwnedRasterArray:
+    """GPU Euclidean Distance Transform with multiband dispatch."""
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            _distance_transform_gpu_single,
+            buffers_per_band=6,
+        )
+    return _distance_transform_gpu_single(raster)
+
+
 # ---------------------------------------------------------------------------
 # Public API: dispatcher (GPU/CPU auto-selection)
 # ---------------------------------------------------------------------------
@@ -423,10 +438,14 @@ def raster_distance_transform(
     (in pixel units) to the nearest foreground (nonzero/True) pixel.
     Foreground pixels have distance 0. Nodata pixels propagate as NaN.
 
+    Multiband rasters are supported: each band is processed independently
+    and the result has the same band count as the input.
+
     Parameters
     ----------
     raster : OwnedRasterArray
-        Input raster. Nonzero (and non-nodata) values are foreground.
+        Input raster (single- or multi-band). Nonzero (and non-nodata)
+        values are foreground.
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
         Auto uses GPU when CuPy is available and pixel count exceeds
@@ -436,7 +455,8 @@ def raster_distance_transform(
     -------
     OwnedRasterArray
         Float64 raster of Euclidean distances. Foreground pixels = 0.0,
-        nodata pixels = NaN (if input has nodata).
+        nodata pixels = NaN (if input has nodata). For multiband input,
+        the output shape is ``(bands, H, W)``.
     """
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)

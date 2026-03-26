@@ -240,12 +240,42 @@ class TestFillSinksCPU:
         assert filled.ndim == 2
         assert filled[1, 1] == pytest.approx(5.0)
 
-    def test_multiband_raises(self):
-        """Multi-band raster should raise ValueError."""
-        data = np.ones((3, 5, 5), dtype=np.float32)
-        raster = from_numpy(data)
-        with pytest.raises(ValueError, match="single-band"):
-            raster_fill_sinks(raster, use_gpu=False)
+    def test_fill_sinks_multiband(self):
+        """3-band DEM: output is (3, H, W) and each band matches single-band result."""
+        rng = np.random.default_rng(42)
+        h, w = 7, 7
+
+        # Build 3 distinct single-band DEMs with a pit in the center
+        bands = []
+        for i in range(3):
+            band = np.full((h, w), 10.0 + i * 5.0, dtype=np.float32)
+            band[2:5, 2:5] = rng.uniform(0.5, 3.0, size=(3, 3)).astype(np.float32)
+            bands.append(band)
+
+        multiband_data = np.stack(bands, axis=0)  # (3, H, W)
+        assert multiband_data.shape == (3, h, w)
+
+        affine = (1.0, 0.0, 100.0, 0.0, -1.0, 200.0)
+        multiband_raster = from_numpy(multiband_data, nodata=-9999.0, affine=affine)
+        result = raster_fill_sinks(multiband_raster, use_gpu=False)
+        result_data = result.to_numpy()
+
+        # Output shape must be (3, H, W)
+        assert result_data.shape == (3, h, w)
+
+        # Metadata preserved
+        assert result.affine == affine
+        assert result.nodata == -9999.0
+
+        # Each band must match independently-filled single-band result
+        for band_idx in range(3):
+            single_raster = from_numpy(bands[band_idx], nodata=-9999.0, affine=affine)
+            single_result = raster_fill_sinks(single_raster, use_gpu=False)
+            np.testing.assert_array_equal(
+                result_data[band_idx],
+                single_result.to_numpy(),
+                err_msg=f"Band {band_idx} mismatch",
+            )
 
     def test_diagnostics_present(self):
         """Result should have diagnostic events."""

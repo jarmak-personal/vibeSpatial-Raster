@@ -741,38 +741,176 @@ class TestRasterPercentileGPU:
 # ---------------------------------------------------------------------------
 
 
-class TestMultibandValidation:
-    """Verify that histogram functions reject multiband rasters."""
+class TestMultibandPerBandDispatch:
+    """Verify that histogram functions dispatch per-band for multiband rasters."""
 
-    def test_histogram_multiband_raises(self):
+    def test_histogram_multiband_per_band(self):
+        """3-band raster: returns list of (counts, edges), one per band."""
         from vibespatial.raster.histogram import raster_histogram
 
-        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        rng = np.random.default_rng(42)
+        # Create 3 bands with distinct distributions so histograms differ
+        band0 = rng.integers(0, 64, size=(16, 16), dtype=np.uint8)
+        band1 = rng.integers(64, 128, size=(16, 16), dtype=np.uint8)
+        band2 = rng.integers(192, 256, size=(16, 16), dtype=np.uint8)
+        data = np.stack([band0, band1, band2], axis=0)
         raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
         assert raster.band_count == 3
 
-        with pytest.raises(ValueError, match="single-band raster"):
-            raster_histogram(raster, use_gpu=False)
+        results = raster_histogram(raster, bins=256, use_gpu=False)
+        assert isinstance(results, list)
+        assert len(results) == 3
 
-    def test_histogram_equalize_multiband_raises(self):
+        for i, (counts, edges) in enumerate(results):
+            assert counts.shape == (256,), f"band {i}: counts shape mismatch"
+            assert edges.shape == (257,), f"band {i}: edges shape mismatch"
+            assert counts.sum() == 16 * 16, f"band {i}: total count mismatch"
+
+        # Verify distributions are distinct: per-band ranges should differ.
+        # Each band's edges are auto-computed from its own data range.
+        _, edges0 = results[0]
+        _, edges2 = results[2]
+        # Band 0 values are in [0, 64), band 2 values are in [192, 256)
+        assert edges0[0] < 64, "band 0 range should start below 64"
+        assert edges2[0] >= 192, "band 2 range should start at 192 or above"
+
+    def test_histogram_multiband_matches_individual_bands(self):
+        """Multiband histogram results must match single-band histograms."""
+        from vibespatial.raster.histogram import raster_histogram
+
+        rng = np.random.default_rng(99)
+        data = rng.integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+
+        # Multiband result
+        multi_results = raster_histogram(raster, bins=128, use_gpu=False)
+
+        # Compare against individual single-band rasters
+        for band_idx in range(3):
+            single = from_numpy(data[band_idx], affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+            single_counts, single_edges = raster_histogram(single, bins=128, use_gpu=False)
+            multi_counts, multi_edges = multi_results[band_idx]
+            np.testing.assert_array_equal(single_counts, multi_counts)
+            np.testing.assert_array_equal(single_edges, multi_edges)
+
+    def test_equalize_multiband(self):
+        """3-band equalization: output shape (3, H, W), dtype uint8."""
         from vibespatial.raster.histogram import raster_histogram_equalize
 
-        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        rng = np.random.default_rng(42)
+        data = rng.integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
         raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
         assert raster.band_count == 3
 
-        with pytest.raises(ValueError, match="single-band raster"):
-            raster_histogram_equalize(raster, use_gpu=False)
+        result = raster_histogram_equalize(raster, use_gpu=False)
+        assert result.dtype == np.uint8
+        assert result.shape == (3, 16, 16)
+        assert result.band_count == 3
+        result_data = result.to_numpy()
+        assert result_data.min() >= 0
+        assert result_data.max() <= 255
+        # Metadata preserved
+        assert result.affine == raster.affine
 
-    def test_percentile_multiband_raises(self):
+    def test_equalize_multiband_preserves_nodata(self):
+        """Multiband equalization preserves nodata metadata from source."""
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        rng = np.random.default_rng(42)
+        data = rng.normal(100.0, 20.0, size=(3, 8, 8)).astype(np.float64)
+        # Place nodata in different positions per band
+        data[0, 2, 3] = -9999.0
+        data[1, 5, 1] = -9999.0
+        data[2, 0, 7] = -9999.0
+        raster = from_numpy(data, nodata=-9999.0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 8.0))
+
+        result = raster_histogram_equalize(raster, use_gpu=False)
+        assert result.dtype == np.uint8
+        assert result.shape == (3, 8, 8)
+        # from_band_stack propagates the source's nodata metadata
+        assert result.nodata == -9999.0
+
+    def test_percentile_multiband(self):
+        """3-band percentiles: returns list of per-band percentile arrays."""
         from vibespatial.raster.histogram import raster_percentile
 
-        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
-        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+        rng = np.random.default_rng(42)
+        # Three bands with clearly different ranges
+        band0 = rng.uniform(0.0, 10.0, size=(20, 20)).astype(np.float64)
+        band1 = rng.uniform(50.0, 60.0, size=(20, 20)).astype(np.float64)
+        band2 = rng.uniform(100.0, 110.0, size=(20, 20)).astype(np.float64)
+        data = np.stack([band0, band1, band2], axis=0)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 20.0))
         assert raster.band_count == 3
 
-        with pytest.raises(ValueError, match="single-band raster"):
-            raster_percentile(raster, 50.0, use_gpu=False)
+        results = raster_percentile(raster, [25, 50, 75], use_gpu=False)
+        assert isinstance(results, list)
+        assert len(results) == 3
+
+        for i, pcts in enumerate(results):
+            assert isinstance(pcts, np.ndarray)
+            assert pcts.shape == (3,), f"band {i}: shape mismatch"
+            # Percentiles must be ordered
+            assert pcts[0] <= pcts[1] <= pcts[2], f"band {i}: not ordered"
+
+        # Band medians should be in their respective ranges
+        assert 0.0 <= results[0][1] <= 10.0, "band 0 median out of range"
+        assert 50.0 <= results[1][1] <= 60.0, "band 1 median out of range"
+        assert 100.0 <= results[2][1] <= 110.0, "band 2 median out of range"
+
+    def test_percentile_multiband_matches_individual_bands(self):
+        """Multiband percentile results must match single-band percentiles."""
+        from vibespatial.raster.histogram import raster_percentile
+
+        rng = np.random.default_rng(99)
+        data = rng.normal(50.0, 15.0, size=(3, 20, 20)).astype(np.float64)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 20.0))
+
+        multi_results = raster_percentile(raster, [10, 50, 90], bins=256, use_gpu=False)
+
+        for band_idx in range(3):
+            single = from_numpy(data[band_idx], affine=(1.0, 0.0, 0.0, 0.0, -1.0, 20.0))
+            single_pcts = raster_percentile(single, [10, 50, 90], bins=256, use_gpu=False)
+            np.testing.assert_array_equal(single_pcts, multi_results[band_idx])
+
+    def test_histogram_multiband_diagnostic_event(self):
+        """Multiband histogram should emit a diagnostic event with 'multiband'."""
+        from vibespatial.raster.buffers import RasterDiagnosticKind
+        from vibespatial.raster.histogram import raster_histogram
+
+        rng = np.random.default_rng(42)
+        data = rng.integers(0, 256, size=(3, 8, 8), dtype=np.uint8)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 8.0))
+
+        raster_histogram(raster, use_gpu=False)
+        runtime_events = [e for e in raster.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert any("multiband" in e.detail for e in runtime_events)
+
+    def test_single_band_return_types_unchanged(self):
+        """Single-band operations must return their original types, not lists."""
+        from vibespatial.raster.histogram import (
+            raster_histogram,
+            raster_histogram_equalize,
+            raster_percentile,
+        )
+
+        data = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+
+        # raster_histogram returns a tuple, not a list
+        hist_result = raster_histogram(raster, use_gpu=False)
+        assert isinstance(hist_result, tuple)
+        assert len(hist_result) == 2
+
+        # raster_histogram_equalize returns OwnedRasterArray
+        eq_result = raster_histogram_equalize(raster, use_gpu=False)
+        assert eq_result.dtype == np.uint8
+        assert eq_result.band_count == 1
+
+        # raster_percentile returns np.ndarray
+        pct_result = raster_percentile(raster, 50.0, use_gpu=False)
+        assert isinstance(pct_result, np.ndarray)
+        assert pct_result.shape == (1,)
 
 
 # ---------------------------------------------------------------------------

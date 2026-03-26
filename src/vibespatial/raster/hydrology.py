@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import time
-import warnings
 
 import numpy as np
 
@@ -27,17 +26,6 @@ from vibespatial.raster.buffers import (
 from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
-
-
-def _warn_multiband_squeeze(arr, *, stacklevel: int = 3):
-    """Emit a UserWarning when silently discarding extra bands from a 3D array."""
-    if arr.shape[0] > 1:
-        warnings.warn(
-            f"Multiband raster with {arr.shape[0]} bands received; "
-            "only band 1 will be processed. Multiband support is planned.",
-            UserWarning,
-            stacklevel=stacklevel,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +75,29 @@ def _fill_sinks_cpu(
     *,
     _max_iterations: int | None = None,
 ) -> OwnedRasterArray:
-    """CPU sink fill via iterative numpy propagation.
+    """CPU sink fill with per-band dispatch for multiband rasters.
+
+    Parameters
+    ----------
+    _max_iterations : int or None
+        Override for max iteration count (testing only).
+    """
+    from vibespatial.raster.dispatch import dispatch_per_band_cpu
+
+    if raster.band_count > 1:
+        return dispatch_per_band_cpu(
+            raster,
+            lambda r: _fill_sinks_cpu_single(r, _max_iterations=_max_iterations),
+        )
+    return _fill_sinks_cpu_single(raster, _max_iterations=_max_iterations)
+
+
+def _fill_sinks_cpu_single(
+    raster: OwnedRasterArray,
+    *,
+    _max_iterations: int | None = None,
+) -> OwnedRasterArray:
+    """CPU sink fill for a single band via iterative numpy propagation.
 
     Implements the same algorithm as the GPU path:
     border pixels keep their elevation, interior pixels start at +inf,
@@ -102,8 +112,6 @@ def _fill_sinks_cpu(
 
     data = raster.to_numpy()
     if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("sink fill requires a single-band raster")
         data = data[0]
 
     height, width = data.shape
@@ -241,7 +249,37 @@ def _fill_sinks_gpu(
     *,
     _max_iterations: int | None = None,
 ) -> OwnedRasterArray:
-    """GPU sink fill using iterative NVRTC propagation kernels.
+    """GPU sink fill with per-band dispatch for multiband rasters.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input DEM raster (single- or multi-band, float32 or float64).
+    _max_iterations : int or None
+        Override for max iteration count (testing only).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Filled DEM raster.
+    """
+    from vibespatial.raster.dispatch import dispatch_per_band_gpu
+
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: _fill_sinks_gpu_single(r, _max_iterations=_max_iterations),
+            buffers_per_band=2,
+        )
+    return _fill_sinks_gpu_single(raster, _max_iterations=_max_iterations)
+
+
+def _fill_sinks_gpu_single(
+    raster: OwnedRasterArray,
+    *,
+    _max_iterations: int | None = None,
+) -> OwnedRasterArray:
+    """GPU sink fill for a single band using iterative NVRTC propagation kernels.
 
     Uses shared-memory tiled 3x3 stencil kernels with convergence detection.
     Same algorithm as CCL: init -> iterate propagation until fixpoint.
@@ -276,10 +314,6 @@ def _fill_sinks_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Validate band count before any transfer ---
-    if raster.band_count != 1:
-        raise ValueError("sink fill requires a single-band raster")
-
     height, width = raster.height, raster.width
 
     # --- Move data to device (zero-copy: no D->H->D ping-pong) ---
@@ -292,7 +326,6 @@ def _fill_sinks_gpu(
 
     # Squeeze band dimension if 3D -> 2D view
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     # Determine working dtype for CUDA kernel
@@ -492,11 +525,14 @@ def raster_fill_sinks(
     water would spill out. This is essential preprocessing for hydrological
     analysis (flow direction, flow accumulation, watershed delineation).
 
+    For multiband rasters, each band is processed independently via per-band
+    dispatch (``dispatch_per_band_gpu`` / ``dispatch_per_band_cpu``).
+
     Parameters
     ----------
     raster : OwnedRasterArray
-        Input DEM raster (single-band). Supports float32, float64, and
-        integer dtypes (integers are promoted to float32 internally).
+        Input DEM raster (single- or multi-band). Supports float32, float64,
+        and integer dtypes (integers are promoted to float32 internally).
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
         Auto uses GPU when available and pixel count exceeds threshold.
@@ -505,7 +541,8 @@ def raster_fill_sinks(
     -------
     OwnedRasterArray
         HOST-resident DEM with all depressions filled to spill elevation.
-        Nodata pixels are preserved unchanged.
+        Nodata pixels are preserved unchanged. For multiband input, the
+        output has the same shape ``(bands, H, W)``.
 
     Notes
     -----
