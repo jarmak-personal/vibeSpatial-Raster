@@ -413,3 +413,165 @@ class TestAutoDispatch:
         result = raster_resample(gradient_raster, target, method="nearest")
         assert result is not None
         np.testing.assert_array_equal(result.to_numpy(), gradient_raster.to_numpy())
+
+
+# ---------------------------------------------------------------------------
+# Multiband resample tests (CPU path)
+# ---------------------------------------------------------------------------
+
+
+class TestResampleMultiband:
+    """Tests for per-band dispatch on multiband rasters."""
+
+    @pytest.fixture
+    def multiband_raster(self):
+        """3-band 6x6 raster with distinct per-band data."""
+        rng = np.random.default_rng(42)
+        band0 = rng.integers(0, 200, size=(6, 6)).astype(np.float64)
+        band1 = rng.integers(0, 200, size=(6, 6)).astype(np.float64)
+        band2 = rng.integers(0, 200, size=(6, 6)).astype(np.float64)
+        data = np.stack([band0, band1, band2], axis=0)  # (3, 6, 6)
+        affine = (10.0, 0.0, 100.0, 0.0, -10.0, 200.0)
+        return from_numpy(data, affine=affine)
+
+    @pytest.fixture
+    def multiband_nodata_raster(self):
+        """3-band 6x6 raster with nodata in known positions."""
+        rng = np.random.default_rng(99)
+        data = rng.random((3, 6, 6)).astype(np.float64) * 100.0
+        # Place nodata at different positions per band
+        data[0, 1, 2] = -9999.0
+        data[1, 3, 4] = -9999.0
+        data[2, 0, 0] = -9999.0
+        affine = (10.0, 0.0, 100.0, 0.0, -10.0, 200.0)
+        return from_numpy(data, nodata=-9999.0, affine=affine)
+
+    def test_resample_multiband_nearest(self, multiband_raster):
+        """Multiband nearest: output shape is (3, newH, newW), matches per-band."""
+        src_a = multiband_raster.affine
+        # Upsample 2x
+        target = GridSpec(
+            affine=(src_a[0] / 2, src_a[1], src_a[2], src_a[3], src_a[4] / 2, src_a[5]),
+            width=12,
+            height=12,
+        )
+        result = raster_resample(multiband_raster, target, method="nearest", use_gpu=False)
+        out = result.to_numpy()
+
+        # Shape check
+        assert out.shape == (3, 12, 12), f"Expected (3, 12, 12), got {out.shape}"
+        assert result.band_count == 3
+
+        # Per-band correctness: multiband result must match applying resample
+        # to each band individually
+        src = multiband_raster.to_numpy()
+        for band_idx in range(3):
+            single = from_numpy(
+                src[band_idx],
+                affine=multiband_raster.affine,
+                crs=multiband_raster.crs,
+            )
+            single_result = raster_resample(single, target, method="nearest", use_gpu=False)
+            np.testing.assert_array_equal(
+                out[band_idx],
+                single_result.to_numpy(),
+                err_msg=f"Band {band_idx} mismatch in nearest multiband resample",
+            )
+
+    def test_resample_multiband_bilinear(self, multiband_raster):
+        """Multiband bilinear: output shape is (3, newH, newW), matches per-band."""
+        src_a = multiband_raster.affine
+        # Upsample 2x
+        target = GridSpec(
+            affine=(src_a[0] / 2, src_a[1], src_a[2], src_a[3], src_a[4] / 2, src_a[5]),
+            width=12,
+            height=12,
+        )
+        result = raster_resample(multiband_raster, target, method="bilinear", use_gpu=False)
+        out = result.to_numpy()
+
+        # Shape check
+        assert out.shape == (3, 12, 12), f"Expected (3, 12, 12), got {out.shape}"
+        assert result.band_count == 3
+
+        # Per-band correctness
+        src = multiband_raster.to_numpy()
+        for band_idx in range(3):
+            single = from_numpy(
+                src[band_idx],
+                affine=multiband_raster.affine,
+                crs=multiband_raster.crs,
+            )
+            single_result = raster_resample(single, target, method="bilinear", use_gpu=False)
+            np.testing.assert_allclose(
+                out[band_idx],
+                single_result.to_numpy(),
+                atol=1e-12,
+                err_msg=f"Band {band_idx} mismatch in bilinear multiband resample",
+            )
+
+    def test_resample_multiband_preserves_metadata(self, multiband_raster):
+        """Multiband resample preserves affine, CRS, nodata, and dtype."""
+        target = GridSpec(
+            affine=(5.0, 0.0, 100.0, 0.0, -5.0, 200.0),
+            width=12,
+            height=12,
+        )
+        result = raster_resample(multiband_raster, target, method="nearest", use_gpu=False)
+        assert result.affine == target.affine
+        assert result.crs == multiband_raster.crs
+        assert result.dtype == multiband_raster.dtype
+        assert result.width == 12
+        assert result.height == 12
+
+    def test_resample_multiband_nodata_propagation(self, multiband_nodata_raster):
+        """Nodata propagates correctly through multiband nearest resample."""
+        target = GridSpec.from_raster(multiband_nodata_raster)
+        result = raster_resample(multiband_nodata_raster, target, method="nearest", use_gpu=False)
+        out = result.to_numpy()
+
+        # Nodata positions should be preserved in identity resample
+        assert out[0, 1, 2] == -9999.0, "Band 0 nodata not propagated"
+        assert out[1, 3, 4] == -9999.0, "Band 1 nodata not propagated"
+        assert out[2, 0, 0] == -9999.0, "Band 2 nodata not propagated"
+        assert result.nodata == -9999.0
+
+    def test_resample_multiband_diagnostics(self, multiband_raster):
+        """Multiband resample emits dispatch_per_band_cpu diagnostic."""
+        target = GridSpec.from_raster(multiband_raster)
+        result = raster_resample(multiband_raster, target, method="nearest", use_gpu=False)
+        runtime_diags = [d for d in result.diagnostics if d.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_diags) >= 1
+        # The dispatch_per_band_cpu wrapper should emit a diagnostic with band count
+        band_diags = [d for d in runtime_diags if "dispatch_per_band_cpu" in d.detail]
+        assert len(band_diags) >= 1, (
+            f"Expected dispatch_per_band_cpu diagnostic, got: {[d.detail for d in runtime_diags]}"
+        )
+        assert "bands=3" in band_diags[0].detail
+
+    def test_resample_multiband_downsample_nearest(self, multiband_raster):
+        """Multiband downsample with nearest matches per-band results."""
+        src_a = multiband_raster.affine
+        target = GridSpec(
+            affine=(src_a[0] * 2, src_a[1], src_a[2], src_a[3], src_a[4] * 2, src_a[5]),
+            width=3,
+            height=3,
+        )
+        result = raster_resample(multiband_raster, target, method="nearest", use_gpu=False)
+        out = result.to_numpy()
+        assert out.shape == (3, 3, 3)
+
+        # Verify per-band consistency
+        src = multiband_raster.to_numpy()
+        for band_idx in range(3):
+            single = from_numpy(
+                src[band_idx],
+                affine=multiband_raster.affine,
+                crs=multiband_raster.crs,
+            )
+            single_result = raster_resample(single, target, method="nearest", use_gpu=False)
+            np.testing.assert_array_equal(
+                out[band_idx],
+                single_result.to_numpy(),
+                err_msg=f"Band {band_idx} mismatch in downsample nearest",
+            )

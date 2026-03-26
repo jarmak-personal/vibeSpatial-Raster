@@ -144,7 +144,33 @@ def _resample_gpu(
     target_grid: GridSpec,
     method: str,
 ) -> OwnedRasterArray:
-    """GPU-accelerated resampling via NVRTC kernel."""
+    """GPU-accelerated resampling via NVRTC kernel.
+
+    For multiband rasters, dispatches per-band via ``dispatch_per_band_gpu``.
+    """
+    from vibespatial.raster.dispatch import dispatch_per_band_gpu
+
+    # Multiband: dispatch per-band then reassemble
+    if raster.band_count > 1:
+        result = dispatch_per_band_gpu(
+            raster,
+            lambda r: _resample_gpu_single(r, target_grid, method),
+            buffers_per_band=2,
+        )
+        # from_band_stack propagates the *source* affine, but resampling
+        # changes the grid -- patch the result to use the target affine.
+        result.affine = target_grid.affine
+        return result
+
+    return _resample_gpu_single(raster, target_grid, method)
+
+
+def _resample_gpu_single(
+    raster: OwnedRasterArray,
+    target_grid: GridSpec,
+    method: str,
+) -> OwnedRasterArray:
+    """GPU-accelerated resampling of a single-band raster via NVRTC kernel."""
     import cupy as cp
 
     from vibespatial.cuda_runtime import (
@@ -169,8 +195,6 @@ def _resample_gpu(
 
     # Ensure 2D (single-band)
     if d_src.ndim == 3:
-        if d_src.shape[0] != 1:
-            raise ValueError("raster_resample requires a single-band raster")
         d_src = d_src[0]
 
     src_height, src_width = d_src.shape
@@ -319,6 +343,39 @@ def _resample_cpu(
 ) -> OwnedRasterArray:
     """CPU-based resampling via numpy (matches GPU kernel coordinate conventions).
 
+    For multiband rasters, dispatches per-band via ``dispatch_per_band_cpu``.
+
+    The coordinate system follows GDAL conventions:
+    - Pixel (col, row) covers area [col, col+1) x [row, row+1)
+    - Pixel center is at (col + 0.5, row + 0.5) in pixel coordinates
+    - The composed inverse transform maps dst pixel centers to src pixel coords
+    - For nearest: floor(src_coord) gives the source array index
+    - For bilinear/bicubic: subtract 0.5 to get array-index-space fractional
+      position, then interpolate
+    """
+    from vibespatial.raster.dispatch import dispatch_per_band_cpu
+
+    # Multiband: dispatch per-band then reassemble
+    if raster.band_count > 1:
+        result = dispatch_per_band_cpu(
+            raster,
+            lambda r: _resample_cpu_single(r, target_grid, method),
+        )
+        # from_band_stack propagates the *source* affine, but resampling
+        # changes the grid -- patch the result to use the target affine.
+        result.affine = target_grid.affine
+        return result
+
+    return _resample_cpu_single(raster, target_grid, method)
+
+
+def _resample_cpu_single(
+    raster: OwnedRasterArray,
+    target_grid: GridSpec,
+    method: str,
+) -> OwnedRasterArray:
+    """CPU-based resampling of a single-band raster via numpy.
+
     The coordinate system follows GDAL conventions:
     - Pixel (col, row) covers area [col, col+1) x [row, row+1)
     - Pixel center is at (col + 0.5, row + 0.5) in pixel coordinates
@@ -331,8 +388,6 @@ def _resample_cpu(
 
     data = raster.to_numpy()
     if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("raster_resample requires a single-band raster")
         data = data[0]
 
     src_height, src_width = data.shape
@@ -506,10 +561,14 @@ def raster_resample(
     inverse affine transform mapping target pixel coordinates to source
     pixel coordinates.
 
+    For multiband rasters, resampling is applied independently to each
+    band via ``dispatch_per_band_gpu`` / ``dispatch_per_band_cpu`` and
+    the results are reassembled into a multiband output.
+
     Parameters
     ----------
     raster : OwnedRasterArray
-        Source raster (single-band).
+        Source raster (single-band or multi-band).
     target_grid : GridSpec
         Target grid defining the output affine, width, and height.
     method : str
@@ -521,13 +580,12 @@ def raster_resample(
     Returns
     -------
     OwnedRasterArray
-        Resampled raster on the target grid, HOST-resident.
+        Resampled raster on the target grid.
 
     Raises
     ------
     ValueError
-        If the method is not one of the supported interpolation methods,
-        or if the raster is multi-band.
+        If the method is not one of the supported interpolation methods.
     """
     if method not in _VALID_METHODS:
         raise ValueError(f"method must be one of {_VALID_METHODS}, got {method!r}")
