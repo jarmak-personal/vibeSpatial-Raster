@@ -627,6 +627,12 @@ def raster_histogram(
         (counts, bin_edges) where counts has shape (bins,) and
         bin_edges has shape (bins + 1,).
     """
+    if raster.band_count != 1:
+        raise ValueError(
+            "raster_histogram requires a single-band raster. "
+            "For multiband, select a band first via indexing."
+        )
+
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
@@ -750,6 +756,12 @@ def raster_histogram_equalize(
     OwnedRasterArray
         Equalized raster with dtype uint8 and values in [0, 255].
     """
+    if raster.band_count != 1:
+        raise ValueError(
+            "raster_histogram_equalize requires a single-band raster. "
+            "For multiband, select a band first via indexing."
+        )
+
     if use_gpu is None:
         use_gpu = _should_use_gpu(raster)
 
@@ -805,6 +817,12 @@ def raster_percentile(
     np.ndarray
         Array of percentile values with shape (len(percentiles),).
     """
+    if raster.band_count != 1:
+        raise ValueError(
+            "raster_percentile requires a single-band raster. "
+            "For multiband, select a band first via indexing."
+        )
+
     if isinstance(percentiles, (int, float)):
         percentiles = [float(percentiles)]
     else:

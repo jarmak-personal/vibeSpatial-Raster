@@ -737,6 +737,45 @@ class TestRasterPercentileGPU:
 
 
 # ---------------------------------------------------------------------------
+# Multiband validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestMultibandValidation:
+    """Verify that histogram functions reject multiband rasters."""
+
+    def test_histogram_multiband_raises(self):
+        from vibespatial.raster.histogram import raster_histogram
+
+        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+        assert raster.band_count == 3
+
+        with pytest.raises(ValueError, match="single-band raster"):
+            raster_histogram(raster, use_gpu=False)
+
+    def test_histogram_equalize_multiband_raises(self):
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+        assert raster.band_count == 3
+
+        with pytest.raises(ValueError, match="single-band raster"):
+            raster_histogram_equalize(raster, use_gpu=False)
+
+    def test_percentile_multiband_raises(self):
+        from vibespatial.raster.histogram import raster_percentile
+
+        data = np.random.default_rng(42).integers(0, 256, size=(3, 16, 16), dtype=np.uint8)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 16.0))
+        assert raster.band_count == 3
+
+        with pytest.raises(ValueError, match="single-band raster"):
+            raster_percentile(raster, 50.0, use_gpu=False)
+
+
+# ---------------------------------------------------------------------------
 # Auto-dispatch tests
 # ---------------------------------------------------------------------------
 
