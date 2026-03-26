@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import time
-import warnings
 
 import numpy as np
 
@@ -21,20 +20,10 @@ from vibespatial.raster.buffers import (
     from_device,
     from_numpy,
 )
+from vibespatial.raster.dispatch import dispatch_per_band_cpu, dispatch_per_band_gpu
 from vibespatial.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
-
-
-def _warn_multiband_squeeze(arr, *, stacklevel: int = 3):
-    """Emit a UserWarning when silently discarding extra bands from a 3D array."""
-    if arr.shape[0] > 1:
-        warnings.warn(
-            f"Multiband raster with {arr.shape[0]} bands received; "
-            "only band 1 will be processed. Multiband support is planned.",
-            UserWarning,
-            stacklevel=stacklevel,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -184,13 +173,21 @@ def _label_cpu(
     *,
     connectivity: int = 4,
 ) -> OwnedRasterArray:
-    """CPU connected component labeling via scipy.ndimage.label."""
+    """CPU connected component labeling via scipy.ndimage.label.
+
+    Multiband rasters are labeled per-band independently via
+    ``dispatch_per_band_cpu``.
+    """
+    if raster.band_count > 1:
+        return dispatch_per_band_cpu(
+            raster,
+            lambda r: _label_cpu(r, connectivity=connectivity),
+        )
+
     from scipy.ndimage import label as scipy_label
 
     data = raster.to_numpy()
     if data.ndim == 3:
-        if data.shape[0] != 1:
-            raise ValueError("connected component labeling requires a single-band raster")
         data = data[0]
 
     # Build foreground mask
@@ -231,6 +228,9 @@ def label_gpu(
     connectivity: int = 4,
 ) -> OwnedRasterArray:
     """GPU connected component labeling using iterative union-find.
+
+    Multiband rasters are labeled per-band independently via
+    ``dispatch_per_band_gpu``.
 
     Uses NVRTC kernels: init_labels -> local_merge -> pointer_jump (iterate)
     -> relabel to compact sequential labels 1..N.
@@ -277,13 +277,18 @@ def label_gpu(
     if connectivity not in (4, 8):
         raise ValueError(f"connectivity must be 4 or 8, got {connectivity}")
 
+    # --- Multiband dispatch: label each band independently ---
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: label_gpu(r, connectivity=connectivity),
+            buffers_per_band=2,
+        )
+
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
     # --- Prepare data on device (zero-copy: no D->H->D ping-pong) ---
-    if raster.band_count != 1:
-        raise ValueError("connected component labeling requires a single-band raster")
-
     height, width = raster.height, raster.width
     n = height * width
 
@@ -295,9 +300,8 @@ def label_gpu(
     )
     d_data = raster.device_data()
 
-    # Squeeze band dimension if 3D -> get a 2D view for the ravel below
+    # Squeeze band dimension if 3D single-band -> get a 2D view
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     # Build foreground mask entirely on device
@@ -599,6 +603,19 @@ def morphology_gpu(
     if connectivity not in (4, 8):
         raise ValueError(f"connectivity must be 4 or 8, got {connectivity}")
 
+    # --- Multiband dispatch: apply morphology per-band ---
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: morphology_gpu(
+                r,
+                operation,
+                connectivity=connectivity,
+                iterations=iterations,
+            ),
+            buffers_per_band=2,
+        )
+
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
@@ -609,7 +626,6 @@ def morphology_gpu(
     )
     d_data = raster.device_data()
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -793,17 +809,29 @@ def _morphology_nxn_gpu(
     if operation not in valid_ops:
         raise ValueError(f"operation must be one of {list(valid_ops)}, got {operation!r}")
 
+    # --- Multiband dispatch: apply NxN morphology per-band ---
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: _morphology_nxn_gpu(
+                r,
+                operation,
+                structuring_element=structuring_element,
+                iterations=iterations,
+            ),
+            buffers_per_band=2,
+        )
+
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device (zero-copy: avoid D→H→D) ---
+    # --- Prepare data on device (zero-copy: avoid D->H->D) ---
     raster.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
     )
     d_data = raster.device_data()
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -816,7 +844,7 @@ def _morphology_nxn_gpu(
         else:
             d_binary &= (d_data != raster.nodata).astype(cp.uint8)
 
-    # Already on device — no transfer needed
+    # Already on device -- no transfer needed
     d_input = d_binary.ravel()
 
     se = structuring_element
@@ -1132,6 +1160,10 @@ def label_connected_components(
     Each group of connected nonzero (and non-nodata) pixels receives a unique
     integer label. Background (zero or nodata) pixels get label 0.
 
+    For multiband rasters, each band is labeled independently: the foreground
+    of each band is labeled as a separate 2-D connected component analysis.
+    The output has the same band count as the input.
+
     Parameters
     ----------
     raster : OwnedRasterArray
@@ -1203,10 +1235,20 @@ def _sieve_cpu(
     *,
     replace_value: int = 0,
 ) -> OwnedRasterArray:
-    """CPU sieve filter using numpy unique/bincount."""
+    """CPU sieve filter using numpy unique/bincount.
+
+    Multiband rasters are sieved per-band independently via
+    ``dispatch_per_band_cpu``.
+    """
+    # --- Multiband dispatch: sieve each band independently ---
+    if labeled.band_count > 1:
+        return dispatch_per_band_cpu(
+            labeled,
+            lambda r: _sieve_cpu(r, min_size, replace_value=replace_value),
+        )
+
     data = labeled.to_numpy().copy()
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
 
     unique_labels, counts = np.unique(data, return_counts=True)
@@ -1243,7 +1285,18 @@ def _sieve_gpu(
     Uses CuPy bincount to count component sizes on-device, then an NVRTC
     threshold kernel to zero out labels below min_size.  No D->H transfers
     until the final result.
+
+    Multiband rasters are sieved per-band independently via
+    ``dispatch_per_band_gpu``.
     """
+    # --- Multiband dispatch: sieve each band independently ---
+    if labeled.band_count > 1:
+        return dispatch_per_band_gpu(
+            labeled,
+            lambda r: _sieve_gpu(r, min_size, replace_value=replace_value),
+            buffers_per_band=2,
+        )
+
     import cupy as cp
 
     from vibespatial.cuda_runtime import (
@@ -1257,15 +1310,13 @@ def _sieve_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Move labeled data to device (zero-copy: avoid D→H→D) ---
+    # --- Move labeled data to device (zero-copy: avoid D->H->D) ---
     labeled.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
     )
     d_data = labeled.device_data()
     if d_data.ndim == 3:
-        if d_data.shape[0] != 1:
-            raise ValueError("sieve_filter requires a single-band raster")
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1446,7 +1497,24 @@ def _morphology_cpu(
     iterations: int = 1,
     structuring_element: np.ndarray | None = None,
 ) -> OwnedRasterArray:
-    """CPU binary morphology via scipy.ndimage."""
+    """CPU binary morphology via scipy.ndimage.
+
+    Multiband rasters are processed per-band independently via
+    ``dispatch_per_band_cpu``.
+    """
+    # --- Multiband dispatch: apply morphology per-band ---
+    if raster.band_count > 1:
+        return dispatch_per_band_cpu(
+            raster,
+            lambda r: _morphology_cpu(
+                r,
+                operation,
+                connectivity=connectivity,
+                iterations=iterations,
+                structuring_element=structuring_element,
+            ),
+        )
+
     from scipy.ndimage import binary_closing, binary_dilation, binary_erosion, binary_opening
 
     ops = {
@@ -1458,7 +1526,6 @@ def _morphology_cpu(
 
     data = raster.to_numpy()
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
 
     binary = data != 0
@@ -1520,11 +1587,10 @@ def _tophat_diff_gpu(
 
     d_orig = raster.device_data()
     if d_orig.ndim == 3:
-        _warn_multiband_squeeze(d_orig)
         d_orig = d_orig[0]
     d_opened = opened.device_data()
     if d_opened.ndim == 3:
-        d_opened = d_opened[0]  # follows primary squeeze above
+        d_opened = d_opened[0]
 
     # Binary foreground mask for original (excluding nodata)
     orig_bin = (d_orig != 0).astype(cp.uint8)
@@ -1563,11 +1629,10 @@ def _tophat_diff_cpu(
 
     original_data = raster.to_numpy()
     if original_data.ndim == 3:
-        _warn_multiband_squeeze(original_data)
         original_data = original_data[0]
     opened_data = opened.to_numpy()
     if opened_data.ndim == 3:
-        opened_data = opened_data[0]  # follows primary squeeze above
+        opened_data = opened_data[0]
 
     orig_bin = (original_data != 0).astype(np.uint8)
     if raster.nodata is not None:
@@ -1616,11 +1681,10 @@ def _blackhat_diff_gpu(
 
     d_orig = raster.device_data()
     if d_orig.ndim == 3:
-        _warn_multiband_squeeze(d_orig)
         d_orig = d_orig[0]
     d_closed = closed.device_data()
     if d_closed.ndim == 3:
-        d_closed = d_closed[0]  # follows primary squeeze above
+        d_closed = d_closed[0]
 
     orig_bin = (d_orig != 0).astype(cp.uint8)
     if raster.nodata is not None:
@@ -1658,11 +1722,10 @@ def _blackhat_diff_cpu(
 
     original_data = raster.to_numpy()
     if original_data.ndim == 3:
-        _warn_multiband_squeeze(original_data)
         original_data = original_data[0]
     closed_data = closed.to_numpy()
     if closed_data.ndim == 3:
-        closed_data = closed_data[0]  # follows primary squeeze above
+        closed_data = closed_data[0]
 
     orig_bin = (original_data != 0).astype(np.uint8)
     if raster.nodata is not None:
@@ -1701,6 +1764,7 @@ def raster_morphology_tophat(
     """White top-hat transform: original minus morphological opening.
 
     Extracts bright features smaller than the structuring element.
+    Multiband rasters are processed per-band independently.
 
     Parameters
     ----------
@@ -1722,6 +1786,20 @@ def raster_morphology_tophat(
         resolved_gpu = _should_use_gpu(raster)
     else:
         resolved_gpu = use_gpu
+
+    # --- Multiband dispatch: tophat per-band ---
+    if raster.band_count > 1:
+        _dispatch = dispatch_per_band_gpu if resolved_gpu else dispatch_per_band_cpu
+        return _dispatch(
+            raster,
+            lambda r: raster_morphology_tophat(
+                r,
+                structuring_element,
+                connectivity=connectivity,
+                use_gpu=use_gpu,
+            ),
+            **({"buffers_per_band": 2} if resolved_gpu else {}),
+        )
 
     opened = raster_morphology(
         raster,
@@ -1748,6 +1826,7 @@ def raster_morphology_blackhat(
     """Black top-hat transform: morphological closing minus original.
 
     Extracts dark features (holes) smaller than the structuring element.
+    Multiband rasters are processed per-band independently.
 
     Parameters
     ----------
@@ -1769,6 +1848,20 @@ def raster_morphology_blackhat(
         resolved_gpu = _should_use_gpu(raster)
     else:
         resolved_gpu = use_gpu
+
+    # --- Multiband dispatch: blackhat per-band ---
+    if raster.band_count > 1:
+        _dispatch = dispatch_per_band_gpu if resolved_gpu else dispatch_per_band_cpu
+        return _dispatch(
+            raster,
+            lambda r: raster_morphology_blackhat(
+                r,
+                structuring_element,
+                connectivity=connectivity,
+                use_gpu=use_gpu,
+            ),
+            **({"buffers_per_band": 2} if resolved_gpu else {}),
+        )
 
     closed = raster_morphology(
         raster,

@@ -936,3 +936,291 @@ class TestDispatcher:
         assert result is not None
         assert result.to_numpy()[0, 0] != 0
         assert result.to_numpy()[0, 3] == 0
+
+
+# ---------------------------------------------------------------------------
+# Multiband dispatch tests (CPU path)
+# ---------------------------------------------------------------------------
+
+
+class TestMultibandCCL:
+    """Per-band connected component labeling on multiband rasters."""
+
+    def test_ccl_multiband_per_band(self):
+        """Each band is labeled independently; output is (3, H, W)."""
+        # Band 0: two blobs separated by a column of zeros
+        band0 = np.array(
+            [
+                [1, 1, 0, 2, 2],
+                [1, 0, 0, 0, 2],
+                [0, 0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        # Band 1: single connected foreground
+        band1 = np.ones((3, 5), dtype=np.int32)
+        # Band 2: checkerboard (each pixel isolated under 4-conn)
+        band2 = np.zeros((3, 5), dtype=np.int32)
+        band2[0, 0] = 1
+        band2[0, 2] = 1
+        band2[0, 4] = 1
+        band2[2, 0] = 1
+        band2[2, 2] = 1
+        band2[2, 4] = 1
+
+        multiband = np.stack([band0, band1, band2], axis=0)
+        assert multiband.shape == (3, 3, 5)
+
+        raster = from_numpy(multiband)
+        result = label_connected_components(raster, connectivity=4, use_gpu=False)
+        labeled = result.to_numpy()
+
+        # Output shape must match input bands
+        assert labeled.shape == (3, 3, 5)
+
+        # Band 0: two components (left blob, right blob), background = 0
+        b0 = labeled[0]
+        b0_labels = set(np.unique(b0)) - {0}
+        assert len(b0_labels) == 2
+        assert b0[0, 0] == b0[1, 0]  # same left blob
+        assert b0[0, 3] == b0[0, 4] == b0[1, 4]  # same right blob
+        assert b0[0, 0] != b0[0, 3]  # different components
+
+        # Band 1: all foreground -> single component
+        b1 = labeled[1]
+        b1_labels = set(np.unique(b1)) - {0}
+        assert len(b1_labels) == 1
+
+        # Band 2: 6 isolated pixels under 4-connectivity
+        b2 = labeled[2]
+        b2_labels = set(np.unique(b2)) - {0}
+        assert len(b2_labels) == 6
+
+    def test_ccl_multiband_metadata_preserved(self):
+        """Multiband CCL preserves affine, CRS, and dtype."""
+        from rasterio.crs import CRS
+        from rasterio.transform import Affine
+
+        affine = Affine(1.0, 0.0, 100.0, 0.0, -1.0, 200.0)
+        crs = CRS.from_epsg(4326)
+
+        data = np.stack(
+            [
+                np.array([[1, 0], [0, 1]], dtype=np.int32),
+                np.array([[1, 1], [1, 1]], dtype=np.int32),
+            ],
+            axis=0,
+        )
+        raster = from_numpy(data, affine=affine, crs=crs)
+        result = label_connected_components(raster, connectivity=4, use_gpu=False)
+
+        assert result.to_numpy().shape == (2, 2, 2)
+        assert result.affine == affine
+        assert result.crs == crs
+        assert result.dtype == np.int32
+
+    def test_ccl_multiband_nodata_propagation(self):
+        """Nodata is excluded from labeling across all bands."""
+        band0 = np.array([[1, -9999, 1]], dtype=np.int32)
+        band1 = np.array([[1, 1, 1]], dtype=np.int32)
+        multiband = np.stack([band0, band1], axis=0)
+
+        raster = from_numpy(multiband, nodata=-9999)
+        result = label_connected_components(raster, connectivity=4, use_gpu=False)
+        labeled = result.to_numpy()
+
+        # Band 0: nodata splits the two 1s into separate components
+        assert labeled[0, 0, 1] == 0  # nodata -> background
+        assert labeled[0, 0, 0] != labeled[0, 0, 2]
+
+        # Band 1: no nodata, all connected
+        b1_labels = set(np.unique(labeled[1])) - {0}
+        assert len(b1_labels) == 1
+
+    def test_ccl_single_band_unchanged(self):
+        """Single-band input still works correctly (regression guard)."""
+        data = np.array(
+            [[1, 1, 0, 2, 2], [1, 0, 0, 0, 2], [0, 0, 3, 3, 0]],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        result = label_connected_components(raster, connectivity=4, use_gpu=False)
+        labeled = result.to_numpy()
+        assert labeled.ndim == 2
+        assert labeled[0, 0] == labeled[1, 0]
+        assert labeled[0, 3] == labeled[0, 4]
+
+
+class TestMultibandMorphology:
+    """Per-band morphology dispatch on multiband rasters."""
+
+    def test_morphology_erode_multiband(self):
+        """3-band binary mask eroded per-band; result is (3, H, W)."""
+        rng = np.random.default_rng(42)
+
+        # Band 0: solid block (erosion shrinks)
+        band0 = np.ones((7, 7), dtype=np.uint8)
+        # Band 1: single center pixel (erosion removes it)
+        band1 = np.zeros((7, 7), dtype=np.uint8)
+        band1[3, 3] = 1
+        # Band 2: random binary
+        band2 = (rng.random((7, 7)) > 0.5).astype(np.uint8)
+
+        multiband = np.stack([band0, band1, band2], axis=0)
+        raster = from_numpy(multiband)
+
+        result = raster_morphology(raster, "erode", connectivity=4, use_gpu=False)
+        result_data = result.to_numpy()
+
+        # Output shape matches input
+        assert result_data.shape == (3, 7, 7)
+
+        # Compare each band against independent single-band result
+        for i, band in enumerate([band0, band1, band2]):
+            single = from_numpy(band)
+            expected = raster_morphology(single, "erode", connectivity=4, use_gpu=False)
+            np.testing.assert_array_equal(
+                result_data[i],
+                expected.to_numpy(),
+                err_msg=f"Band {i} mismatch for erode",
+            )
+
+    def test_morphology_dilate_multiband(self):
+        """3-band binary mask dilated per-band."""
+        band0 = np.zeros((5, 5), dtype=np.uint8)
+        band0[2, 2] = 1
+        band1 = np.zeros((5, 5), dtype=np.uint8)
+        band1[0, 0] = 1
+        band2 = np.ones((5, 5), dtype=np.uint8)
+
+        multiband = np.stack([band0, band1, band2], axis=0)
+        raster = from_numpy(multiband)
+
+        result = raster_morphology(raster, "dilate", connectivity=4, use_gpu=False)
+        result_data = result.to_numpy()
+
+        assert result_data.shape == (3, 5, 5)
+
+        for i, band in enumerate([band0, band1, band2]):
+            single = from_numpy(band)
+            expected = raster_morphology(single, "dilate", connectivity=4, use_gpu=False)
+            np.testing.assert_array_equal(
+                result_data[i],
+                expected.to_numpy(),
+                err_msg=f"Band {i} mismatch for dilate",
+            )
+
+    def test_morphology_open_close_multiband(self):
+        """Open and close operations work on multiband rasters."""
+        band0 = np.zeros((7, 7), dtype=np.uint8)
+        band0[2:5, 2:5] = 1
+        band0[3, 6] = 1  # small protrusion
+        band1 = np.ones((7, 7), dtype=np.uint8)
+        band1[3, 3] = 0  # small hole
+
+        multiband = np.stack([band0, band1], axis=0)
+        raster = from_numpy(multiband)
+
+        for op in ("open", "close"):
+            result = raster_morphology(raster, op, connectivity=4, use_gpu=False)
+            result_data = result.to_numpy()
+            assert result_data.shape == (2, 7, 7)
+
+            for i, band in enumerate([band0, band1]):
+                single = from_numpy(band)
+                expected = raster_morphology(single, op, connectivity=4, use_gpu=False)
+                np.testing.assert_array_equal(
+                    result_data[i],
+                    expected.to_numpy(),
+                    err_msg=f"Band {i} mismatch for {op}",
+                )
+
+    def test_morphology_multiband_metadata_preserved(self):
+        """Multiband morphology preserves affine, CRS, and dtype."""
+        from rasterio.crs import CRS
+        from rasterio.transform import Affine
+
+        affine = Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 6000000.0)
+        crs = CRS.from_epsg(32633)
+
+        data = np.stack(
+            [
+                np.ones((5, 5), dtype=np.uint8),
+                np.zeros((5, 5), dtype=np.uint8),
+            ],
+            axis=0,
+        )
+        raster = from_numpy(data, affine=affine, crs=crs)
+        result = raster_morphology(raster, "erode", connectivity=4, use_gpu=False)
+
+        assert result.to_numpy().shape == (2, 5, 5)
+        assert result.affine == affine
+        assert result.crs == crs
+
+    def test_morphology_single_band_unchanged(self):
+        """Single-band morphology still works correctly (regression guard)."""
+        data = np.array(
+            [[0, 0, 0], [0, 1, 0], [0, 0, 0]],
+            dtype=np.float32,
+        )
+        raster = from_numpy(data)
+        result = raster_morphology(raster, "dilate", connectivity=4, use_gpu=False)
+        assert result.to_numpy().ndim == 2
+        assert result.to_numpy()[0, 1] != 0  # top neighbor dilated
+
+
+class TestMultibandSieve:
+    """Per-band sieve dispatch on multiband rasters."""
+
+    def test_morphology_sieve_multiband(self):
+        """3-band sieve: small components removed per-band independently."""
+        # Band 0: one large component (4px) + one small (1px)
+        band0 = np.array(
+            [[1, 1, 0, 2, 0], [1, 1, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        # Band 1: all single-pixel components
+        band1 = np.array(
+            [[1, 0, 2, 0, 3], [0, 4, 0, 5, 0]],
+            dtype=np.int32,
+        )
+        # Band 2: one large component spanning entire row
+        band2 = np.array(
+            [[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+
+        multiband = np.stack([band0, band1, band2], axis=0)
+        raster = from_numpy(multiband)
+
+        # Label each band
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        # Sieve with min_size=3
+        sieved = sieve_filter(labeled, min_size=3, use_gpu=False)
+        sieved_data = sieved.to_numpy()
+
+        assert sieved_data.shape == (3, 2, 5)
+
+        # Band 0: large component (4px) survives, small (1px) removed
+        assert sieved_data[0, 0, 0] != 0  # large component
+        assert sieved_data[0, 0, 3] == 0  # small component removed
+
+        # Band 1: all single-pixel, all removed
+        assert not sieved_data[1].any()
+
+        # Band 2: 5-pixel component survives
+        assert sieved_data[2, 0, 0] != 0
+
+    def test_sieve_single_band_unchanged(self):
+        """Single-band sieve still works correctly (regression guard)."""
+        data = np.array(
+            [[1, 1, 0, 2, 0], [1, 1, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=3, use_gpu=False)
+        result = sieved.to_numpy()
+        assert result.ndim == 2
+        assert result[0, 0] != 0
+        assert result[0, 3] == 0
