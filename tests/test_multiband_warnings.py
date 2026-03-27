@@ -310,12 +310,12 @@ def test_focal_mean_multiband_cpu():
 # ---------------------------------------------------------------------------
 
 
-def test_morphology_cpu_multiband_warns(multiband_binary_raster):
-    """CPU morphology path warns on multiband input."""
+def test_morphology_cpu_multiband_dispatches(multiband_binary_raster):
+    """CPU morphology path dispatches per-band on multiband input."""
     from vibespatial.raster.label import raster_morphology
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_morphology(multiband_binary_raster, "erode", use_gpu=False)
+    result = raster_morphology(multiband_binary_raster, "erode", use_gpu=False)
+    assert result.to_numpy().shape == (3, 4, 4)
 
 
 # ---------------------------------------------------------------------------

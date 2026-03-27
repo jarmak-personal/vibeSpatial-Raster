@@ -111,7 +111,7 @@ class TestExpressionValidation:
 
         r1 = from_numpy(np.zeros((2, 2)))
         r2 = from_numpy(np.zeros((3, 3)))
-        with pytest.raises(ValueError, match="same shape"):
+        with pytest.raises(ValueError, match="same spatial dimensions"):
             raster_expression("a + b", use_gpu=False, a=r1, b=r2)
 
 

@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-27T01:56:55Z",
-  "staged_hash": "26a0d254f1875b86b543dd1673f96eaf8f9e6e25c786f22422c8d60082f74fed",
-  "files": ["tests/test_multiband_pipeline.py"],
+  "timestamp": "2026-03-27T02:00:16Z",
+  "staged_hash": "971eca8760a2adc7d5c5787d2e59cdd5b721792d17367add593da4e564f0b244",
+  "files": [".claude/.review-completed","tests/test_multiband_warnings.py","tests/test_raster_expression.py"],
   "verdict": "LAND"
 }
