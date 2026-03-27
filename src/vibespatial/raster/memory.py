@@ -4,10 +4,19 @@ Provides a three-tier RMM-based memory pool with CuPy fallback:
 
 | Tier | Activation                           | Allocator Stack                              |
 |------|--------------------------------------|----------------------------------------------|
-| A    | RMM installed (default)              | PoolMemoryResource -> CudaMemoryResource     |
-| B    | VIBESPATIAL_GPU_OOM_SAFETY=1         | FailureCallback -> Pool -> Cuda              |
+| A    | VIBESPATIAL_GPU_POOL_ONLY=1          | PoolMemoryResource -> CudaMemoryResource     |
+| B    | RMM installed (default)              | FailureCallback -> Pool -> Cuda              |
 | C    | VIBESPATIAL_GPU_MANAGED_MEMORY=1     | Bare ManagedMemoryResource                   |
 | Fall | RMM not installed                    | CuPy MemoryPool (default)                    |
+
+Tier B is the default because its OOM callback provides robust recovery
+from pool fragmentation.  The callback first tries ``gc.collect()`` to
+free unreferenced CuPy arrays; if that fails, it tears down and rebuilds
+the pool to release all held blocks back to the CUDA driver, then retries.
+
+Tier A (pool-only, no OOM callback) is opt-in via ``VIBESPATIAL_GPU_POOL_ONLY=1``
+for users who want maximum performance and are willing to manage memory
+pressure themselves.
 
 All imports are lazy -- this module does not import CuPy or RMM at module
 level.  The pool is configured exactly once on the first GPU operation via
@@ -39,6 +48,11 @@ _MANAGED_MEMORY_THRESHOLD = 0.50
 Tier C (managed memory) to avoid OOM on shared GPUs.  Set to 0.0 to
 disable auto-detection."""
 
+_POOL_MAX_SIZE_FRACTION = 0.80
+"""Tier A maximum pool size as a fraction of total VRAM.  Prevents the
+pool from consuming all device memory, leaving headroom for non-pool
+allocations (driver overhead, CUDA contexts, etc.)."""
+
 # ---------------------------------------------------------------------------
 # Module-level state (guarded by a lock for thread safety)
 # ---------------------------------------------------------------------------
@@ -50,10 +64,15 @@ _stats_adaptor: object | None = None  # StatisticsResourceAdaptor when Tier A/B
 
 
 # ---------------------------------------------------------------------------
-# Tier B: OOM callback with gc.collect + retry
+# Tier B: OOM callback with gc.collect + pool rebuild + retry
 # ---------------------------------------------------------------------------
 
-_OOM_MAX_RETRIES = 3
+_OOM_GC_RETRIES = 3
+"""Number of gc.collect()-only retries before escalating to pool rebuild."""
+
+_OOM_MAX_RETRIES = 5
+"""Total retry budget including pool-rebuild attempts."""
+
 _OOM_COOLDOWN_SECONDS = 1.0
 _oom_last_retry_time: float = 0.0
 _oom_retry_count: int = 0
@@ -63,9 +82,15 @@ def _oom_callback(nbytes: int) -> bool:
     """Failure callback for Tier B.
 
     Called by RMM's ``FailureCallbackResourceAdaptor`` when an allocation
-    fails.  We run ``gc.collect()`` to release unreferenced CuPy arrays
-    (which frees their underlying RMM allocations), then signal RMM to
-    retry.
+    fails.  The recovery strategy escalates:
+
+    1. Retries 1-3: ``gc.collect()`` to release unreferenced CuPy arrays
+       (which frees their underlying RMM allocations), then retry.
+    2. Retries 4-5: Tear down and rebuild the entire RMM pool via
+       ``free_pool_memory()``, releasing all held blocks back to the
+       CUDA driver.  This is heavier but handles pool fragmentation
+       where ``gc.collect()`` alone cannot coalesce free blocks into
+       the contiguous region needed.
 
     The callback returns True to retry the allocation or False to raise
     ``MemoryError``.
@@ -92,14 +117,51 @@ def _oom_callback(nbytes: int) -> bool:
     _oom_retry_count += 1
     _oom_last_retry_time = now
 
-    logger.debug(
-        "OOM callback: retry %d/%d for %d bytes -- running gc.collect()",
-        _oom_retry_count,
-        _OOM_MAX_RETRIES,
-        nbytes,
-    )
-    gc.collect()
+    if _oom_retry_count <= _OOM_GC_RETRIES:
+        # Phase 1: lightweight -- gc.collect() releases unreferenced arrays
+        logger.debug(
+            "OOM callback: gc retry %d/%d for %d bytes",
+            _oom_retry_count,
+            _OOM_GC_RETRIES,
+            nbytes,
+        )
+        gc.collect()
+    else:
+        # Phase 2: heavy -- rebuild the pool to defragment
+        logger.warning(
+            "OOM callback: pool rebuild retry %d/%d for %d bytes "
+            "(gc.collect retries exhausted, rebuilding pool)",
+            _oom_retry_count,
+            _OOM_MAX_RETRIES,
+            nbytes,
+        )
+        gc.collect()
+        _rebuild_pool()
+
     return True
+
+
+def _rebuild_pool() -> None:
+    """Tear down and rebuild the Tier B pool to release fragmented blocks.
+
+    This is called from the OOM callback when gc.collect() alone cannot
+    free enough contiguous memory.  The PoolMemoryResource holds onto
+    freed blocks and cannot always coalesce them; rebuilding forces all
+    free blocks back to the CUDA driver.
+
+    IMPORTANT: This rebuilds the pool *in place* by replacing the
+    upstream PoolMemoryResource inside the existing adaptor chain.
+    The FailureCallbackResourceAdaptor and StatisticsResourceAdaptor
+    wrappers remain valid because RMM re-wires them on
+    set_current_device_resource().
+    """
+    try:
+        from rmm.allocators.cupy import rmm_cupy_allocator
+
+        logger.debug("_rebuild_pool: tearing down and rebuilding Tier B pool")
+        _configure_tier_b(rmm_cupy_allocator)
+    except Exception:
+        logger.debug("_rebuild_pool: pool rebuild failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +177,8 @@ def configure_memory_pool() -> str:
 
     Tier selection priority:
       1. ``VIBESPATIAL_GPU_MANAGED_MEMORY=1`` -> Tier C
-      2. ``VIBESPATIAL_GPU_OOM_SAFETY=1``     -> Tier B
-      3. RMM importable                       -> Tier A
+      2. ``VIBESPATIAL_GPU_POOL_ONLY=1``      -> Tier A (no OOM recovery)
+      3. RMM importable                       -> Tier B (default, with OOM recovery)
       4. Fallback                             -> CuPy default pool
     """
     global _configured, _active_tier, _stats_adaptor
@@ -137,7 +199,7 @@ def _configure_unlocked() -> str:
     global _stats_adaptor
 
     env_managed = os.environ.get("VIBESPATIAL_GPU_MANAGED_MEMORY", "0") == "1"
-    env_oom_safety = os.environ.get("VIBESPATIAL_GPU_OOM_SAFETY", "0") == "1"
+    env_pool_only = os.environ.get("VIBESPATIAL_GPU_POOL_ONLY", "0") == "1"
 
     # Try RMM first
     try:
@@ -151,9 +213,9 @@ def _configure_unlocked() -> str:
     if env_managed:
         return _configure_tier_c(rmm_cupy_allocator)
 
-    # Tier B: Pool with FailureCallbackResourceAdaptor
-    if env_oom_safety:
-        return _configure_tier_b(rmm_cupy_allocator)
+    # Tier A: Pool-only (no OOM callback) -- opt-in for max performance
+    if env_pool_only:
+        return _configure_tier_a(rmm_cupy_allocator)
 
     # Auto-detect: if less than 50% of total VRAM is free, use Tier C
     # (managed memory) to avoid OOM on shared GPUs.  When the GPU is
@@ -175,22 +237,36 @@ def _configure_unlocked() -> str:
     except Exception:
         pass
 
-    # Tier A: Pool (default)
-    return _configure_tier_a(rmm_cupy_allocator)
+    # Tier B: Pool with OOM callback (default -- safe for all workloads)
+    return _configure_tier_b(rmm_cupy_allocator)
 
 
 def _configure_tier_a(rmm_cupy_allocator) -> str:
     """Tier A: PoolMemoryResource -> CudaMemoryResource.
 
     Uses ``initial_pool_size=0`` so the pool grows on demand without
-    starving other processes.
+    starving other processes.  Sets ``maximum_pool_size`` to 80% of
+    total VRAM to leave headroom for non-pool allocations.
     """
     global _stats_adaptor
 
     import rmm.mr
 
+    # Cap the pool at 80% of total VRAM to prevent the pool from
+    # consuming everything and leaving no headroom for CUDA driver
+    # overhead, contexts, or non-pool allocations.
+    max_pool_size = 0
+    try:
+        _free, total = rmm.mr.available_device_memory()
+        max_pool_size = int(total * _POOL_MAX_SIZE_FRACTION)
+    except Exception:
+        pass  # Fall through with 0 (unlimited) if we can't query
+
     cuda_mr = rmm.mr.CudaMemoryResource()
-    pool_mr = rmm.mr.PoolMemoryResource(cuda_mr, initial_pool_size=0)
+    pool_kwargs: dict = {"initial_pool_size": 0}
+    if max_pool_size > 0:
+        pool_kwargs["maximum_pool_size"] = max_pool_size
+    pool_mr = rmm.mr.PoolMemoryResource(cuda_mr, **pool_kwargs)
     stats_mr = rmm.mr.StatisticsResourceAdaptor(pool_mr)
 
     rmm.mr.set_current_device_resource(stats_mr)

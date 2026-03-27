@@ -408,6 +408,16 @@ class OwnedRasterArray:
         if self.device_state is None:
             return
 
+        # Deferred memory pool initialization (ADR-0040): ensure the
+        # RMM/CuPy pool is configured before any CuPy operation.
+        # cp.asnumpy() may allocate temporary device buffers through
+        # CuPy's allocator, so the pool must be wired up before D->H
+        # transfers too -- not just H->D (which goes through
+        # _ensure_device_state).
+        from vibespatial.raster.memory import _ensure_memory_pool
+
+        _ensure_memory_pool()
+
         try:
             import cupy as cp
         except ImportError as err:
