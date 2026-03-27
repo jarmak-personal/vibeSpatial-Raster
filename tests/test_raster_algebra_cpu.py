@@ -250,6 +250,98 @@ class TestBinaryOpCpuFallback:
 
 
 # ---------------------------------------------------------------------------
+# Multiband binary operations — CPU path
+# ---------------------------------------------------------------------------
+
+
+class TestMultibandBinaryOpsCpu:
+    """Verify multiband dispatch for binary algebra on CPU."""
+
+    def test_both_multiband_add(self):
+        """Both inputs 3-band: operate band-by-band on CPU."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]],
+                [[9.0, 10.0], [11.0, 12.0]],
+            ]
+        )
+        b_data = np.array(
+            [
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[50.0, 60.0], [70.0, 80.0]],
+                [[90.0, 100.0], [110.0, 120.0]],
+            ]
+        )
+        a = from_numpy(a_data)
+        b = from_numpy(b_data)
+        result = raster_add(a, b, use_gpu=False)
+        out = result.to_numpy()
+        assert out.shape == (3, 2, 2)
+        np.testing.assert_array_almost_equal(out, a_data + b_data)
+
+    def test_multiband_broadcast_single(self):
+        """3-band + single-band: broadcast single across all bands on CPU."""
+        from vibespatial.raster.algebra import raster_subtract
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[50.0, 60.0], [70.0, 80.0]],
+                [[90.0, 100.0], [110.0, 120.0]],
+            ]
+        )
+        b_data = np.array([[1.0, 2.0], [3.0, 4.0]])
+        a = from_numpy(a_data)
+        b = from_numpy(b_data)
+        result = raster_subtract(a, b, use_gpu=False)
+        out = result.to_numpy()
+        assert out.shape == (3, 2, 2)
+        for band in range(3):
+            np.testing.assert_array_almost_equal(out[band], a_data[band] - b_data)
+
+    def test_multiband_nodata_propagation_cpu(self):
+        """Nodata propagation per-band on CPU."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[1.0, -9999.0], [3.0, 4.0]],
+                [[5.0, 6.0], [-9999.0, 8.0]],
+            ]
+        )
+        b_data = np.array(
+            [
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[50.0, 60.0], [70.0, 80.0]],
+            ]
+        )
+        a = from_numpy(a_data, nodata=-9999.0)
+        b = from_numpy(b_data, nodata=-9999.0)
+        result = raster_add(a, b, use_gpu=False)
+        out = result.to_numpy()
+        assert out.shape == (2, 2, 2)
+        assert out[0, 0, 1] == -9999.0  # nodata in band 0
+        assert out[1, 1, 0] == -9999.0  # nodata in band 1
+        np.testing.assert_almost_equal(out[0, 0, 0], 11.0)
+
+    def test_mismatched_band_counts_raises_cpu(self):
+        """Two multiband rasters with different band counts should raise."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(np.random.rand(2, 3, 3))
+        b = from_numpy(np.random.rand(3, 3, 3))
+        with pytest.raises(ValueError, match="band counts must match"):
+            raster_add(a, b, use_gpu=False)
+
+
+# ---------------------------------------------------------------------------
 # raster_apply — CPU path
 # ---------------------------------------------------------------------------
 

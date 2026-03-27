@@ -256,6 +256,115 @@ class TestRasterClassify:
 
 
 # ---------------------------------------------------------------------------
+# Multiband binary operations
+# ---------------------------------------------------------------------------
+
+
+class TestMultibandBinaryOps:
+    """Verify multiband dispatch for binary algebra on GPU."""
+
+    def test_both_multiband_add(self):
+        """Both inputs 3-band: operate band-by-band."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]],
+                [[9.0, 10.0], [11.0, 12.0]],
+            ]
+        )
+        b_data = np.array(
+            [
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[50.0, 60.0], [70.0, 80.0]],
+                [[90.0, 100.0], [110.0, 120.0]],
+            ]
+        )
+        a = from_numpy(a_data)
+        b = from_numpy(b_data)
+        result = raster_add(a, b)
+        out = result.to_numpy()
+        assert out.shape == (3, 2, 2)
+        np.testing.assert_array_almost_equal(out, a_data + b_data)
+
+    def test_multiband_broadcast_single(self):
+        """3-band + single-band: broadcast single across all bands."""
+        from vibespatial.raster.algebra import raster_multiply
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]],
+                [[9.0, 10.0], [11.0, 12.0]],
+            ]
+        )
+        b_data = np.array([[2.0, 3.0], [4.0, 5.0]])
+        a = from_numpy(a_data)
+        b = from_numpy(b_data)
+        result = raster_multiply(a, b)
+        out = result.to_numpy()
+        assert out.shape == (3, 2, 2)
+        for band in range(3):
+            np.testing.assert_array_almost_equal(out[band], a_data[band] * b_data)
+
+    def test_multiband_nodata_propagation(self):
+        """Nodata in one band should propagate per-band."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array(
+            [
+                [[1.0, -9999.0], [3.0, 4.0]],
+                [[5.0, 6.0], [-9999.0, 8.0]],
+            ]
+        )
+        b_data = np.array(
+            [
+                [[10.0, 20.0], [30.0, 40.0]],
+                [[50.0, 60.0], [70.0, 80.0]],
+            ]
+        )
+        a = from_numpy(a_data, nodata=-9999.0)
+        b = from_numpy(b_data, nodata=-9999.0)
+        result = raster_add(a, b)
+        out = result.to_numpy()
+        assert out.shape == (2, 2, 2)
+        assert out[0, 0, 1] == -9999.0  # nodata in band 0
+        assert out[1, 1, 0] == -9999.0  # nodata in band 1
+        np.testing.assert_almost_equal(out[0, 0, 0], 11.0)
+        np.testing.assert_almost_equal(out[1, 0, 0], 55.0)
+
+    def test_multiband_divide_by_zero(self):
+        """Division by zero in multiband should produce nodata per-band."""
+        from vibespatial.raster.algebra import raster_divide
+        from vibespatial.raster.buffers import from_numpy
+
+        a_data = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+        b_data = np.array([[[0.0, 1.0], [2.0, 0.0]]])
+        a = from_numpy(a_data, nodata=-9999.0)
+        b = from_numpy(b_data, nodata=-9999.0)
+        result = raster_divide(a, b)
+        out = result.to_numpy()
+        assert out[0, 0, 0] == -9999.0  # div by zero
+        assert out[0, 1, 1] == -9999.0  # div by zero
+        np.testing.assert_almost_equal(out[0, 0, 1], 2.0)
+        np.testing.assert_almost_equal(out[0, 1, 0], 1.5)
+
+    def test_mismatched_band_counts_raises(self):
+        """Two multiband rasters with different band counts should raise."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(np.random.rand(2, 3, 3))
+        b = from_numpy(np.random.rand(3, 3, 3))
+        with pytest.raises(ValueError, match="band counts must match"):
+            raster_add(a, b)
+
+
+# ---------------------------------------------------------------------------
 # Focal operations (o17.8.5)
 # ---------------------------------------------------------------------------
 

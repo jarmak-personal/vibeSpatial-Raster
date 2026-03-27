@@ -338,3 +338,240 @@ def band_expression_cache_key(
     payload = f"{expression}|{band_count}|{dtype}"
     digest = hashlib.sha1(payload.encode()).hexdigest()
     return f"band_expr_{dtype}_{band_count}b-{digest}"
+
+
+# ---------------------------------------------------------------------------
+# Fused binary operation kernel — single-pass add/sub/mul/div with nodata
+# ---------------------------------------------------------------------------
+
+# Template placeholders:
+#   {dtype}      - C type name: "float" or "double"
+#   {op_expr}    - C operator expression: "a_val + b_val", etc.
+#   {check_nodata_a} - nodata check for input a (empty string when no nodata)
+#   {check_nodata_b} - nodata check for input b (empty string when no nodata)
+#   {isnan_f}    - "isnan" (both float/double resolve correctly in CUDA)
+#   {isinf_f}    - "isinf"
+
+FUSED_BINARY_KERNEL_SOURCE_TEMPLATE = r"""
+extern "C" __global__
+void fused_binary_op(
+    const {dtype}* __restrict__ a,
+    const {dtype}* __restrict__ b,
+    {dtype}* __restrict__ output,
+    const {dtype} nodata_out,
+    const int n
+) {{
+    const int stride = blockDim.x * gridDim.x;
+    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+         base < n;
+         base += stride * 4) {{
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {{
+            int i = base + j * stride;
+            if (i >= n) break;
+
+            {dtype} a_val = a[i];
+            {dtype} b_val = b[i];
+
+            // Check input nodata
+            bool is_nodata = false;
+            {check_nodata_a}
+            {check_nodata_b}
+
+            if (is_nodata) {{
+                output[i] = nodata_out;
+                continue;
+            }}
+
+            // Compute operation
+            {dtype} result = ({dtype})({op_expr});
+
+            // Guard inf/nan (division by zero, overflow, etc.)
+            if ({isinf_f}(result) || {isnan_f}(result)) {{
+                output[i] = nodata_out;
+            }} else {{
+                output[i] = result;
+            }}
+        }}
+    }}
+}}
+"""
+
+# Variant without any nodata sentinel — inf/nan results become NaN
+FUSED_BINARY_KERNEL_NO_NODATA_SOURCE_TEMPLATE = r"""
+extern "C" __global__
+void fused_binary_op(
+    const {dtype}* __restrict__ a,
+    const {dtype}* __restrict__ b,
+    {dtype}* __restrict__ output,
+    unsigned char* __restrict__ has_bad,
+    const int n
+) {{
+    const int stride = blockDim.x * gridDim.x;
+    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+         base < n;
+         base += stride * 4) {{
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {{
+            int i = base + j * stride;
+            if (i >= n) break;
+
+            {dtype} a_val = a[i];
+            {dtype} b_val = b[i];
+
+            // Compute operation
+            {dtype} result = ({dtype})({op_expr});
+
+            // Flag inf/nan for host-side nodata assignment
+            if ({isinf_f}(result) || {isnan_f}(result)) {{
+                has_bad[0] = 1;
+            }}
+            output[i] = result;
+        }}
+    }}
+}}
+"""
+
+# Map op_name to C expression
+_BINARY_OP_EXPRS = {
+    "+": "a_val + b_val",
+    "-": "a_val - b_val",
+    "*": "a_val * b_val",
+    "/": "a_val / b_val",
+}
+
+
+def generate_fused_binary_kernel(
+    op: str,
+    dtype: str,
+    nodata_a: float | None,
+    nodata_b: float | None,
+    nodata_out: float,
+) -> str:
+    """Generate a fused NVRTC kernel source for a binary raster operation.
+
+    The generated kernel performs the operation, nodata propagation, and
+    inf/nan guarding in a single pass with ILP=4 grid-stride loop.
+
+    Parameters
+    ----------
+    op : str
+        Arithmetic operator: ``"+"``, ``"-"``, ``"*"``, or ``"/"``.
+    dtype : str
+        C type name: ``"float"`` or ``"double"``.
+    nodata_a : float or None
+        Nodata sentinel for input A.  ``None`` means no nodata.
+    nodata_b : float or None
+        Nodata sentinel for input B.  ``None`` means no nodata.
+    nodata_out : float
+        Nodata sentinel value for the output.
+
+    Returns
+    -------
+    str
+        Complete NVRTC kernel source ready for ``runtime.compile_kernels()``.
+
+    Raises
+    ------
+    ValueError
+        If *op* is not one of ``"+"``, ``"-"``, ``"*"``, ``"/"``, or *dtype*
+        is not ``"float"`` or ``"double"``.
+    """
+    if op not in _BINARY_OP_EXPRS:
+        raise ValueError(f"op must be one of {sorted(_BINARY_OP_EXPRS)}, got {op!r}")
+    if dtype not in ("float", "double"):
+        raise ValueError(f"dtype must be 'float' or 'double', got {dtype!r}")
+
+    op_expr = _BINARY_OP_EXPRS[op]
+
+    # Build nodata checks.  For NaN sentinels use isnan(); for finite
+    # sentinels use exact equality.
+    def _nodata_check(var: str, sentinel: float | None) -> str:
+        if sentinel is None:
+            return ""
+        import math
+
+        if math.isnan(sentinel):
+            return f"if (isnan({var}_val)) is_nodata = true;"
+        # Exact equality check against the sentinel
+        if dtype == "float":
+            return f"if ({var}_val == ({dtype}){sentinel!r}f) is_nodata = true;"
+        else:
+            return f"if ({var}_val == ({dtype}){sentinel!r}) is_nodata = true;"
+
+    check_nodata_a = _nodata_check("a", nodata_a)
+    check_nodata_b = _nodata_check("b", nodata_b)
+
+    return FUSED_BINARY_KERNEL_SOURCE_TEMPLATE.format(
+        dtype=dtype,
+        op_expr=op_expr,
+        check_nodata_a=check_nodata_a,
+        check_nodata_b=check_nodata_b,
+        isnan_f="isnan",
+        isinf_f="isinf",
+    )
+
+
+def generate_fused_binary_kernel_no_nodata(
+    op: str,
+    dtype: str,
+) -> str:
+    """Generate a fused NVRTC kernel for binary ops when no nodata sentinel exists.
+
+    This variant writes the raw result (including inf/nan) and sets a single
+    ``has_bad`` flag byte if any inf/nan is produced, so the caller can decide
+    post-hoc which sentinel to use.
+
+    Parameters
+    ----------
+    op : str
+        Arithmetic operator: ``"+"``, ``"-"``, ``"*"``, or ``"/"``.
+    dtype : str
+        C type name: ``"float"`` or ``"double"``.
+
+    Returns
+    -------
+    str
+        Complete NVRTC kernel source.
+    """
+    if op not in _BINARY_OP_EXPRS:
+        raise ValueError(f"op must be one of {sorted(_BINARY_OP_EXPRS)}, got {op!r}")
+    if dtype not in ("float", "double"):
+        raise ValueError(f"dtype must be 'float' or 'double', got {dtype!r}")
+
+    return FUSED_BINARY_KERNEL_NO_NODATA_SOURCE_TEMPLATE.format(
+        dtype=dtype,
+        op_expr=_BINARY_OP_EXPRS[op],
+        isnan_f="isnan",
+        isinf_f="isinf",
+    )
+
+
+def fused_binary_cache_key(
+    op: str,
+    dtype: str,
+    nodata_a: float | None,
+    nodata_b: float | None,
+    nodata_out: float | None,
+) -> str:
+    """Compute a unique cache key for a fused binary operation kernel.
+
+    Parameters
+    ----------
+    op : str
+        Arithmetic operator.
+    dtype : str
+        C type name.
+    nodata_a, nodata_b : float or None
+        Input nodata sentinels.
+    nodata_out : float or None
+        Output nodata sentinel.
+
+    Returns
+    -------
+    str
+        Cache key string for ``runtime.compile_kernels()``.
+    """
+    payload = f"{op}|{dtype}|{nodata_a!r}|{nodata_b!r}|{nodata_out!r}"
+    digest = hashlib.sha1(payload.encode()).hexdigest()
+    return f"fused_binop_{op}_{dtype}-{digest}"

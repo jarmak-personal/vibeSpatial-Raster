@@ -85,49 +85,199 @@ def _should_use_gpu_algebra(
         return False
 
 
+_OP_NAME_TO_SYMBOL = {
+    "add": "+",
+    "subtract": "-",
+    "multiply": "*",
+    "divide": "/",
+}
+
+
 def _binary_op_gpu(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
-    """GPU path for binary element-wise operations using CuPy."""
+    """GPU path for binary element-wise operations using a fused NVRTC kernel.
+
+    A single kernel launch handles the operation, nodata propagation from both
+    inputs, and inf/nan guarding.  This replaces the previous 7-kernel CuPy
+    chain with a single fused pass.
+    """
+    import ctypes
+
     import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+    )
+    from vibespatial.raster.kernels.algebra import (
+        fused_binary_cache_key,
+        generate_fused_binary_kernel,
+        generate_fused_binary_kernel_no_nodata,
+    )
 
     t0 = time.perf_counter()
 
     da = _to_device_data(a)
     db = _to_device_data(b)
 
-    result_device = op_func(da, db)
+    # Determine compute dtype
+    out_dtype = np.result_type(a.dtype, b.dtype)
+    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
+        dtype_name = "float"
+        compute_dtype = np.float32
+    else:
+        dtype_name = "double"
+        compute_dtype = np.float64
 
-    # Determine the output nodata value
+    # Cast to compute dtype (zero-copy if already correct)
+    da = da.astype(compute_dtype, copy=False)
+    db = db.astype(compute_dtype, copy=False)
+
+    # Flatten to 1D for the grid-stride loop
+    da_flat = da.ravel()
+    db_flat = db.ravel()
+    n_pixels = da_flat.size
+
+    # Determine nodata values
     nodata = a.nodata if a.nodata is not None else b.nodata
+    op_symbol = _OP_NAME_TO_SYMBOL.get(op_name, "+")
 
-    # Build a single combined mask covering:
-    #   1. Input nodata pixels (either input is nodata -> output is nodata)
-    #   2. Inf/NaN produced by the operation (e.g., division by zero)
-    # Applying this in one pass avoids double-masking and ensures that
-    # legitimate computed values matching the nodata sentinel are preserved.
-    bad_values = cp.logical_or(cp.isinf(result_device), cp.isnan(result_device))
+    runtime = get_cuda_runtime()
+
     if nodata is not None:
-        mask_a = a.device_nodata_mask()
-        mask_b = b.device_nodata_mask()
-        combined_mask = cp.logical_or(cp.logical_or(mask_a, mask_b), bad_values)
-        result_device = cp.where(combined_mask, nodata, result_device)
-    elif cp.any(bad_values):
-        # No nodata sentinel available — use NaN for float, 0 for integer
-        if cp.issubdtype(result_device.dtype, cp.floating):
-            result_device = cp.where(bad_values, cp.nan, result_device)
-            nodata = float("nan")
+        # -- Fused kernel with nodata propagation --
+        nodata_a = a.nodata
+        nodata_b = b.nodata
+        nodata_out = float(nodata)
+
+        source = generate_fused_binary_kernel(
+            op=op_symbol,
+            dtype=dtype_name,
+            nodata_a=float(nodata_a) if nodata_a is not None else None,
+            nodata_b=float(nodata_b) if nodata_b is not None else None,
+            nodata_out=nodata_out,
+        )
+        cache_key = fused_binary_cache_key(
+            op=op_symbol,
+            dtype=dtype_name,
+            nodata_a=float(nodata_a) if nodata_a is not None else None,
+            nodata_b=float(nodata_b) if nodata_b is not None else None,
+            nodata_out=nodata_out,
+        )
+
+        kernels = runtime.compile_kernels(
+            cache_key=cache_key,
+            source=source,
+            kernel_names=("fused_binary_op",),
+        )
+
+        d_output = cp.empty_like(da_flat)
+
+        # Parameter type for nodata: c_float for float32, c_double for float64
+        if dtype_name == "float":
+            nodata_param_type = ctypes.c_float
         else:
-            result_device = cp.where(bad_values, 0, result_device)
-            nodata = 0
+            from vibespatial.cuda_runtime import KERNEL_PARAM_F64
+
+            nodata_param_type = KERNEL_PARAM_F64
+
+        param_values = (
+            da_flat.data.ptr,
+            db_flat.data.ptr,
+            d_output.data.ptr,
+            compute_dtype(nodata_out).item(),
+            n_pixels,
+        )
+        param_types = (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            nodata_param_type,
+            KERNEL_PARAM_I32,
+        )
+
+        grid, block = runtime.launch_config(kernels["fused_binary_op"], n_pixels)
+        runtime.launch(
+            kernel=kernels["fused_binary_op"],
+            grid=grid,
+            block=block,
+            params=(param_values, param_types),
+        )
+
+        result_device = d_output.reshape(da.shape)
+
+    else:
+        # -- No nodata sentinel: compute and detect inf/nan --
+        source = generate_fused_binary_kernel_no_nodata(
+            op=op_symbol,
+            dtype=dtype_name,
+        )
+        cache_key = fused_binary_cache_key(
+            op=op_symbol,
+            dtype=dtype_name,
+            nodata_a=None,
+            nodata_b=None,
+            nodata_out=None,
+        )
+
+        kernels = runtime.compile_kernels(
+            cache_key=cache_key,
+            source=source,
+            kernel_names=("fused_binary_op",),
+        )
+
+        d_output = cp.empty_like(da_flat)
+        d_has_bad = cp.zeros(1, dtype=cp.uint8)
+
+        param_values = (
+            da_flat.data.ptr,
+            db_flat.data.ptr,
+            d_output.data.ptr,
+            d_has_bad.data.ptr,
+            n_pixels,
+        )
+        param_types = (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        )
+
+        grid, block = runtime.launch_config(kernels["fused_binary_op"], n_pixels)
+        runtime.launch(
+            kernel=kernels["fused_binary_op"],
+            grid=grid,
+            block=block,
+            params=(param_values, param_types),
+        )
+
+        # Single scalar D2H to check if any inf/nan was produced
+        has_bad = int(d_has_bad.get())
+        if has_bad:
+            if np.issubdtype(out_dtype, np.floating):
+                # Leave inf/nan in place; they serve as the nodata sentinel
+                nodata = float("nan")
+            else:
+                nodata = 0
+
+        result_device = d_output.reshape(da.shape)
 
     elapsed = time.perf_counter() - t0
 
-    # Build result as DEVICE-resident (zero-copy, no D→H transfer)
+    # Build result as DEVICE-resident (zero-copy, no D->H transfer)
     result = from_device(result_device, nodata=nodata, affine=a.affine, crs=a.crs)
     result.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"raster_{op_name} [GPU] shape={a.shape} dtype={a.dtype} elapsed={elapsed:.4f}s",
+            detail=(
+                f"gpu_kernel=fused_binary_op raster_{op_name} [GPU] "
+                f"shape={a.shape} dtype={a.dtype} pixels={n_pixels} "
+                f"elapsed={elapsed:.4f}s"
+            ),
             residency=Residency.DEVICE,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
         )
     )
     return result
@@ -193,17 +343,154 @@ def _binary_op(
     replace inf/nan with the nodata sentinel — that is handled uniformly
     so that legitimate computed values equal to the nodata sentinel are
     never spuriously masked.
+
+    Multiband dispatch:
+    - Both multiband with same band count: operate band-by-band.
+    - One multiband + one single-band: broadcast single across all bands.
+    - Both single-band: direct operation.
     """
-    if a.shape != b.shape:
+    # Validate spatial dimensions match
+    if (a.height, a.width) != (b.height, b.width):
         raise ValueError(f"raster shapes must match for {op_name}: {a.shape} vs {b.shape}")
+
+    a_bands = a.band_count
+    b_bands = b.band_count
+
+    # Validate band compatibility
+    if a_bands > 1 and b_bands > 1 and a_bands != b_bands:
+        raise ValueError(
+            f"raster band counts must match for {op_name} when both are multiband: "
+            f"{a_bands} vs {b_bands}"
+        )
 
     if use_gpu is None:
         use_gpu = _should_use_gpu_algebra(a, b)
 
+    # Single-band fast path (no multiband dispatch needed)
+    if a_bands == 1 and b_bands == 1:
+        if use_gpu:
+            return _binary_op_gpu(a, b, op_name, gpu_op_func)
+        else:
+            return _binary_op_cpu(a, b, op_name, np_op_func)
+
+    # Multiband dispatch
+    n_bands = max(a_bands, b_bands)
+
     if use_gpu:
-        return _binary_op_gpu(a, b, op_name, gpu_op_func)
+        return _binary_op_multiband_gpu(a, b, op_name, gpu_op_func, n_bands)
     else:
-        return _binary_op_cpu(a, b, op_name, np_op_func)
+        return _binary_op_multiband_cpu(a, b, op_name, np_op_func, n_bands)
+
+
+def _binary_op_multiband_gpu(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    op_name: str,
+    gpu_op_func,
+    n_bands: int,
+) -> OwnedRasterArray:
+    """GPU multiband dispatch for binary operations.
+
+    Transfers both rasters to device once, then dispatches the fused binary
+    kernel per-band via zero-copy band views.
+    """
+    from vibespatial.raster.dispatch import _single_band_view_gpu
+
+    t0 = time.perf_counter()
+
+    # Transfer both rasters to device once
+    a.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"raster_{op_name} multiband: transfer input a to device",
+    )
+    b.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"raster_{op_name} multiband: transfer input b to device",
+    )
+
+    band_results = []
+    for band_idx in range(n_bands):
+        # Get per-band views (zero-copy)
+        a_band = (
+            _single_band_view_gpu(a, band_idx)
+            if a.band_count > 1
+            else _single_band_view_gpu(a, 0)
+            if a.band_count == 1 and a.device_data().ndim == 3
+            else a
+        )
+        b_band = (
+            _single_band_view_gpu(b, band_idx)
+            if b.band_count > 1
+            else _single_band_view_gpu(b, 0)
+            if b.band_count == 1 and b.device_data().ndim == 3
+            else b
+        )
+
+        band_result = _binary_op_gpu(a_band, b_band, op_name, gpu_op_func)
+        band_results.append(band_result)
+
+    result = OwnedRasterArray.from_band_stack(band_results, source=a)
+    elapsed = time.perf_counter() - t0
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"raster_{op_name} multiband_gpu bands={n_bands} "
+                f"shape=({n_bands},{a.height},{a.width}) elapsed={elapsed:.4f}s"
+            ),
+            residency=result.residency,
+        )
+    )
+    return result
+
+
+def _binary_op_multiband_cpu(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    op_name: str,
+    np_op_func,
+    n_bands: int,
+) -> OwnedRasterArray:
+    """CPU multiband dispatch for binary operations."""
+    from vibespatial.raster.dispatch import _single_band_view_cpu
+
+    t0 = time.perf_counter()
+
+    band_results = []
+    for band_idx in range(n_bands):
+        a_band = (
+            _single_band_view_cpu(a, band_idx)
+            if a.band_count > 1
+            else _single_band_view_cpu(a, 0)
+            if a.band_count == 1 and a.data.ndim == 3
+            else a
+        )
+        b_band = (
+            _single_band_view_cpu(b, band_idx)
+            if b.band_count > 1
+            else _single_band_view_cpu(b, 0)
+            if b.band_count == 1 and b.data.ndim == 3
+            else b
+        )
+
+        band_result = _binary_op_cpu(a_band, b_band, op_name, np_op_func)
+        band_results.append(band_result)
+
+    result = OwnedRasterArray.from_band_stack(band_results, source=a)
+    elapsed = time.perf_counter() - t0
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"raster_{op_name} multiband_cpu bands={n_bands} "
+                f"shape=({n_bands},{a.height},{a.width}) elapsed={elapsed:.4f}s"
+            ),
+            residency=result.residency,
+        )
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
