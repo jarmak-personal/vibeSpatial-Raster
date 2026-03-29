@@ -1,16 +1,19 @@
-"""Tiling execution engine for pointwise (trivial) raster operations.
+"""Tiling execution engine for raster operations.
 
-Phase 1 of the tiling infrastructure (vibeSpatial-fx3.2): processes rasters
-in spatial chunks that fit in VRAM, enabling large-raster GPU processing
-without OOM.  Each tile undergoes a HOST->DEVICE->HOST round trip
-independently so that the full raster never needs to reside on the GPU at
-once.
+Phase 1 (vibeSpatial-fx3.2): pointwise (zero-overlap) tiling.  Processes
+rasters in spatial chunks that fit in VRAM, enabling large-raster GPU
+processing without OOM.  Each tile undergoes a HOST->DEVICE->HOST round
+trip independently so that the full raster never needs to reside on the
+GPU at once.
 
-For pointwise (zero-overlap) operations the tiles are non-overlapping
-rectangles that partition the raster.  The results are stitched by direct
-array assignment -- no blending or overlap reconciliation is required.
+Phase 2 (vibeSpatial-fx3.3): halo tiling for stencil/focal operations.
+Extends Phase 1 with overlap (halo) pixels so that each tile includes
+enough border context for neighbourhood kernels (convolution, slope,
+hillshade, morphology, focal statistics).  The result is trimmed back to
+the effective tile region and stitched seamlessly.
 
 ADR: vibeSpatial-fx3.2  Phase 1: Trivial tiling for pointwise operations
+ADR: vibeSpatial-fx3.3  Phase 2: Halo tiling for stencil operations
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "dispatch_tiled",
     "dispatch_tiled_binary",
+    "dispatch_tiled_halo",
 ]
 
 
@@ -437,6 +441,200 @@ def dispatch_tiled_binary(
                 f"dispatch_tiled_binary tiles={tiles_processed} "
                 f"tile_shape=({tile_h},{tile_w}) "
                 f"raster_shape={a.shape} "
+                f"elapsed={elapsed:.4f}s"
+            ),
+            residency=Residency.HOST,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
+
+
+def dispatch_tiled_halo(
+    raster: OwnedRasterArray,
+    op_fn: Callable[[OwnedRasterArray], OwnedRasterArray],
+    plan: RasterPlan,
+) -> OwnedRasterArray:
+    """Execute a unary stencil/focal operation using halo-aware spatial tiling.
+
+    Similar to :func:`dispatch_tiled` but each tile is extracted with extra
+    *halo* border pixels so that neighbourhood kernels (convolution, slope,
+    hillshade, morphology, focal statistics) have sufficient context at tile
+    edges.  After ``op_fn`` processes the full physical tile the halo border
+    is trimmed and only the interior (effective) region is stitched into the
+    output.
+
+    Parameters
+    ----------
+    raster:
+        Input raster (single- or multi-band).  Must be HOST-resident for
+        the TILED path; the WHOLE fast path accepts any residency.
+    op_fn:
+        The stencil operation to apply per tile.  Receives a tile-sized
+        ``OwnedRasterArray`` that includes halo border pixels and returns a
+        result of the **same** spatial dimensions as its input (i.e. the
+        operation does not strip the halo itself).  The dispatcher handles
+        trimming.
+    plan:
+        A frozen ``RasterPlan`` produced by ``analyze_raster_plan()``.
+        ``plan.halo`` specifies the overlap pixels.  ``plan.tile_shape``
+        specifies the **effective** (output) tile dimensions, *not*
+        including the halo.
+
+    Returns
+    -------
+    OwnedRasterArray
+        Result raster with the same shape, affine, CRS, and nodata as the
+        input.  The dtype is determined by ``op_fn``'s output.
+
+    Raises
+    ------
+    ValueError
+        If ``plan.strategy`` is ``TILED`` but ``plan.tile_shape`` is None,
+        or if the raster is DEVICE-resident on the TILED path.
+    """
+    from vibespatial.raster.buffers import (
+        RasterDiagnosticEvent,
+        RasterDiagnosticKind,
+        TilingStrategy,
+        from_numpy,
+    )
+    from vibespatial.residency import Residency
+
+    # -- WHOLE fast path: no tiling overhead --
+    if plan.strategy == TilingStrategy.WHOLE:
+        return op_fn(raster)
+
+    # -- TILED path --
+    if plan.tile_shape is None:
+        raise ValueError(
+            "RasterPlan has strategy=TILED but tile_shape is None; this indicates a malformed plan"
+        )
+
+    t0 = time.perf_counter()
+
+    tile_h, tile_w = plan.tile_shape
+    halo = plan.halo
+    host = _ensure_host_resident(raster, label="dispatch_tiled_halo")
+    raster_h = raster.height
+    raster_w = raster.width
+
+    # Lazy output allocation: deferred until first tile result so that the
+    # output dtype matches op_fn's actual return dtype.
+    output: np.ndarray | None = None
+
+    rows_of_tiles = (raster_h + tile_h - 1) // tile_h
+    cols_of_tiles = (raster_w + tile_w - 1) // tile_w
+
+    tiles_processed = 0
+    result_nodata: float | int | None = raster.nodata
+
+    for tr in range(rows_of_tiles):
+        for tc in range(cols_of_tiles):
+            # Effective bounds: the output region for this tile (same as
+            # dispatch_tiled's non-overlapping partitioning).
+            eff_rs, eff_re, eff_cs, eff_ce = _tile_bounds(
+                tr,
+                tc,
+                tile_h,
+                tile_w,
+                raster_h,
+                raster_w,
+            )
+
+            # Physical bounds: expand each edge by halo, clamped to raster
+            # bounds.  This is the region that gets extracted and fed to
+            # op_fn so that the stencil has sufficient neighbourhood context
+            # at tile edges.
+            phys_rs = max(0, eff_rs - halo)
+            phys_re = min(raster_h, eff_re + halo)
+            phys_cs = max(0, eff_cs - halo)
+            phys_ce = min(raster_w, eff_ce + halo)
+
+            # Slice the physical tile from host data.
+            if host.ndim == 3:
+                tile_data = np.ascontiguousarray(host[:, phys_rs:phys_re, phys_cs:phys_ce])
+            else:
+                tile_data = np.ascontiguousarray(host[phys_rs:phys_re, phys_cs:phys_ce])
+
+            # Adjust affine to the physical tile's origin (not the
+            # effective origin).  This ensures world-coordinate lookups
+            # inside op_fn (e.g. cell_size from affine for slope) are
+            # correct for the data that op_fn receives.
+            tile_affine = _adjust_affine(raster.affine, row_offset=phys_rs, col_offset=phys_cs)
+
+            tile_raster = from_numpy(
+                tile_data,
+                nodata=raster.nodata,
+                affine=tile_affine,
+                crs=raster.crs,
+            )
+
+            # Apply the stencil operation on the full physical tile.
+            tile_result = op_fn(tile_raster)
+
+            tile_host = tile_result.to_numpy()
+
+            # Trim halo from the result to extract only the interior
+            # (effective) region.  At raster boundaries the actual halo
+            # may be less than the requested halo because the physical
+            # bounds were clamped.
+            top_trim = eff_rs - phys_rs
+            left_trim = eff_cs - phys_cs
+            eff_height = eff_re - eff_rs
+            eff_width = eff_ce - eff_cs
+
+            if tile_host.ndim == 3:
+                interior = tile_host[
+                    :,
+                    top_trim : top_trim + eff_height,
+                    left_trim : left_trim + eff_width,
+                ]
+            else:
+                interior = tile_host[
+                    top_trim : top_trim + eff_height,
+                    left_trim : left_trim + eff_width,
+                ]
+
+            # Lazy allocation on first tile result.
+            if output is None:
+                if host.ndim == 3:
+                    output = np.empty(
+                        (host.shape[0], raster_h, raster_w),
+                        dtype=interior.dtype,
+                    )
+                else:
+                    output = np.empty((raster_h, raster_w), dtype=interior.dtype)
+                result_nodata = tile_result.nodata
+
+            if output.ndim == 3:
+                output[:, eff_rs:eff_re, eff_cs:eff_ce] = interior
+            else:
+                output[eff_rs:eff_re, eff_cs:eff_ce] = interior
+
+            # Release tile references so RMM/CuPy can reclaim memory.
+            del tile_raster, tile_result, tile_host, tile_data, interior
+
+            tiles_processed += 1
+
+    elapsed = time.perf_counter() - t0
+
+    if output is None:
+        raise ValueError("Zero tiles processed; input raster has degenerate dimensions")
+
+    result = from_numpy(
+        output,
+        nodata=result_nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"dispatch_tiled_halo tiles={tiles_processed} "
+                f"tile_shape=({tile_h},{tile_w}) halo={halo} "
+                f"raster_shape={raster.shape} "
                 f"elapsed={elapsed:.4f}s"
             ),
             residency=Residency.HOST,

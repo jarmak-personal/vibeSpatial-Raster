@@ -34,6 +34,7 @@ from vibespatial.raster.tiling import (
     _tile_bounds,
     dispatch_tiled,
     dispatch_tiled_binary,
+    dispatch_tiled_halo,
 )
 
 # ---------------------------------------------------------------------------
@@ -933,3 +934,552 @@ class TestLazyImport:
         from vibespatial.raster import dispatch_tiled_binary as dtb
 
         assert callable(dtb)
+
+    def test_dispatch_tiled_halo_importable(self):
+        from vibespatial.raster import dispatch_tiled_halo as dth
+
+        assert callable(dth)
+
+
+# ===========================================================================
+# Phase 2: dispatch_tiled_halo — halo tiling for stencil operations
+# (vibeSpatial-fx3.3)
+# ===========================================================================
+
+
+def _make_halo_plan(
+    tile_h: int = 32,
+    tile_w: int = 32,
+    halo: int = 1,
+) -> RasterPlan:
+    """Create a TILED RasterPlan with given tile dimensions and halo."""
+    return RasterPlan(
+        strategy=TilingStrategy.TILED,
+        tile_shape=(tile_h, tile_w),
+        halo=halo,
+        n_tiles=0,
+        estimated_vram_per_tile=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — WHOLE fast path
+# ---------------------------------------------------------------------------
+
+
+class TestHaloWholeFastPath:
+    def test_whole_calls_op_fn_directly(self):
+        """WHOLE plan passes the raster through op_fn without tiling."""
+        raster = _make_raster(64, 64)
+        calls: list[OwnedRasterArray] = []
+
+        def spy_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            calls.append(r)
+            return r
+
+        result = dispatch_tiled_halo(raster, spy_op, _WHOLE_PLAN)
+        assert len(calls) == 1
+        assert calls[0] is raster
+        assert result is raster
+
+    def test_whole_returns_op_fn_result(self):
+        raster = _make_raster(32, 32)
+
+        def double_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(
+                r.to_numpy() * 2,
+                nodata=r.nodata,
+                affine=r.affine,
+                crs=r.crs,
+            )
+
+        result = dispatch_tiled_halo(raster, double_op, _WHOLE_PLAN)
+        np.testing.assert_allclose(result.to_numpy(), raster.to_numpy() * 2)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — identity reconstruction
+# ---------------------------------------------------------------------------
+
+
+class TestHaloIdentityReconstruction:
+    def test_identity_with_halo_exact_reconstruction(self):
+        """Tiling an identity function with halo reconstructs the original."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        def identity(r: OwnedRasterArray) -> OwnedRasterArray:
+            return r
+
+        result = dispatch_tiled_halo(raster, identity, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+        assert result.shape == raster.shape
+
+    def test_identity_large_halo(self):
+        """Halo larger than half the tile still reconstructs correctly."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_halo_plan(16, 16, halo=8)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_identity_halo_1(self):
+        """Minimal halo=1 with identity op reconstructs exactly."""
+        raster = _make_raster(48, 48, dtype=np.float64)
+        plan = _make_halo_plan(16, 16, halo=1)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — edge tile handling
+# ---------------------------------------------------------------------------
+
+
+class TestHaloEdgeTiles:
+    def test_non_divisible_raster(self):
+        """50x50 raster with 32x32 tiles and halo=2: edge tiles work."""
+        raster = _make_raster(50, 50, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_edge_tiles_have_reduced_halo(self):
+        """At raster boundary, physical tile halo is clamped.
+
+        For tile (0,0), the top and left halo is 0 because there are no
+        pixels above or to the left of the raster.  The physical tile
+        should be larger than the effective tile but only on the bottom
+        and right edges.
+        """
+        raster = _make_raster(50, 50, dtype=np.float32)
+        halo = 3
+        plan = _make_halo_plan(25, 25, halo=halo)
+        physical_shapes: list[tuple[int, ...]] = []
+
+        def shape_spy(r: OwnedRasterArray) -> OwnedRasterArray:
+            physical_shapes.append(r.shape)
+            return r
+
+        dispatch_tiled_halo(raster, shape_spy, plan)
+
+        # 2x2 tile grid for 50x50 with 25x25 effective tiles
+        assert len(physical_shapes) == 4
+
+        # Tile (0,0): top/left halo = 0, bottom/right halo = 3 -> (28, 28)
+        assert physical_shapes[0] == (25 + halo, 25 + halo)
+        # Tile (0,1): top halo = 0, left halo = 3, bottom halo = 3,
+        #             right halo = 0 (clamped at 50) -> (28, 28)
+        assert physical_shapes[1] == (25 + halo, 25 + halo)
+        # Tile (1,0): top halo = 3, left halo = 0, bottom = 0,
+        #             right halo = 3 -> (28, 28)
+        assert physical_shapes[2] == (25 + halo, 25 + halo)
+        # Tile (1,1): top = 3, left = 3, bottom = 0, right = 0 -> (28, 28)
+        assert physical_shapes[3] == (25 + halo, 25 + halo)
+
+    def test_raster_smaller_than_tile(self):
+        """Raster smaller than tile -> single tile with reduced halo."""
+        raster = _make_raster(10, 15, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=4)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_single_pixel_raster_with_halo(self):
+        """1x1 raster with halo -- halo is clamped to 0 on all edges."""
+        raster = _make_raster(1, 1, dtype=np.float32, fill=99.0)
+        plan = _make_halo_plan(32, 32, halo=5)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.to_numpy().item() == pytest.approx(99.0)
+        assert result.shape == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — trim correctness
+# ---------------------------------------------------------------------------
+
+
+class TestHaloTrimCorrectness:
+    def test_stencil_op_trims_halo_artifacts(self):
+        """A stencil op that writes -1 at edges has those artifacts trimmed.
+
+        The op writes -1 to a 1-pixel border of its input (simulating
+        stencil boundary artifacts).  Only the interior should appear in
+        the output.  With proper trim, the output equals the identity
+        everywhere except at the *raster* boundary where the first/last
+        row/col tiles have no halo on that edge.
+        """
+        raster = _make_raster(64, 64, dtype=np.float32, fill=1.0)
+        halo = 2
+        plan = _make_halo_plan(32, 32, halo=halo)
+
+        def border_corrupt_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            """Identity but writes -1 to a halo-width border."""
+            data = r.to_numpy().copy()
+            h, w = data.shape[-2], data.shape[-1]
+            if data.ndim == 3:
+                data[:, :halo, :] = -1.0
+                data[:, h - halo :, :] = -1.0
+                data[:, :, :halo] = -1.0
+                data[:, :, w - halo :] = -1.0
+            else:
+                data[:halo, :] = -1.0
+                data[h - halo :, :] = -1.0
+                data[:, :halo] = -1.0
+                data[:, w - halo :] = -1.0
+            return from_numpy(data, nodata=r.nodata, affine=r.affine, crs=r.crs)
+
+        result = dispatch_tiled_halo(raster, border_corrupt_op, plan)
+        rd = result.to_numpy()
+
+        # Interior tiles (not at raster boundary) should be fully clean.
+        # The effective interior excludes the first/last 'halo' rows/cols
+        # of the raster because those tiles have no halo to trim on the
+        # boundary side -- the border_corrupt_op corrupts those pixels.
+        inner = rd[halo : 64 - halo, halo : 64 - halo]
+        np.testing.assert_array_equal(inner, 1.0)
+
+    def test_physical_tile_larger_than_effective(self):
+        """Each physical tile is strictly larger than the effective tile
+        (except when the entire raster fits in one tile)."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        halo = 3
+        plan = _make_halo_plan(32, 32, halo=halo)
+        physical_shapes: list[tuple[int, int]] = []
+        effective_shapes: list[tuple[int, int]] = []
+
+        _call_idx = [0]
+
+        def shape_tracker(r: OwnedRasterArray) -> OwnedRasterArray:
+            h, w = r.height, r.width
+            physical_shapes.append((h, w))
+            # Compute effective shape from tile grid position
+            tile_h, tile_w = 32, 32
+            raster_h, raster_w = 64, 64
+            tr = _call_idx[0] // 2
+            tc = _call_idx[0] % 2
+            rs, re, cs, ce = _tile_bounds(tr, tc, tile_h, tile_w, raster_h, raster_w)
+            effective_shapes.append((re - rs, ce - cs))
+            _call_idx[0] += 1
+            return r
+
+        dispatch_tiled_halo(raster, shape_tracker, plan)
+
+        for phys, eff in zip(physical_shapes, effective_shapes):
+            assert phys[0] >= eff[0]
+            assert phys[1] >= eff[1]
+            # At least one dimension should have halo expansion
+            assert phys[0] > eff[0] or phys[1] > eff[1]
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — multiband
+# ---------------------------------------------------------------------------
+
+
+class TestHaloMultiband:
+    def test_3band_identity_with_halo(self):
+        """3-band raster with halo tiles correctly on spatial dims."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+        assert result.band_count == 3
+        assert result.shape == (3, 64, 64)
+
+    def test_multiband_edge_tiles_with_halo(self):
+        """Multiband raster with non-divisible dims and halo."""
+        raster = _make_raster(50, 50, bands=3, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=3)
+
+        def double_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(
+                r.to_numpy() * 2,
+                nodata=r.nodata,
+                affine=r.affine,
+                crs=r.crs,
+            )
+
+        result = dispatch_tiled_halo(raster, double_op, plan)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.shape == (3, 50, 50)
+
+    def test_multiband_tile_slices_all_bands(self):
+        """Each halo tile receives all bands."""
+        raster = _make_raster(32, 32, bands=4, dtype=np.uint8)
+        plan = _make_halo_plan(16, 16, halo=2)
+
+        def check_bands(r: OwnedRasterArray) -> OwnedRasterArray:
+            assert r.band_count == 4
+            assert r.to_numpy().ndim == 3
+            assert r.to_numpy().shape[0] == 4
+            return r
+
+        dispatch_tiled_halo(raster, check_bands, plan)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — affine adjustment
+# ---------------------------------------------------------------------------
+
+
+class TestHaloAffineAdjustment:
+    def test_tile_affine_shifted_to_physical_position(self):
+        """Each tile's affine is shifted to the physical tile origin,
+        not the effective origin."""
+        affine = (10.0, 0.0, 500.0, 0.0, -10.0, 1000.0)
+        raster = _make_raster(64, 64, affine=affine)
+        halo = 2
+        plan = _make_halo_plan(32, 32, halo=halo)
+        tile_affines: list[tuple[float, ...]] = []
+
+        def affine_spy(r: OwnedRasterArray) -> OwnedRasterArray:
+            tile_affines.append(r.affine)
+            return r
+
+        dispatch_tiled_halo(raster, affine_spy, plan)
+
+        a, b, c, d, e, f = affine
+
+        # 2x2 tile grid -> 4 tiles
+        assert len(tile_affines) == 4
+
+        # Tile (0,0): phys_rs=max(0,0-2)=0, phys_cs=max(0,0-2)=0
+        assert tile_affines[0] == (a, b, c, d, e, f)
+
+        # Tile (0,1): eff_cs=32, phys_cs=max(0,32-2)=30
+        expected_c_01 = c + 30 * a
+        assert tile_affines[1] == (a, b, expected_c_01, d, e, f)
+
+        # Tile (1,0): eff_rs=32, phys_rs=max(0,32-2)=30
+        expected_f_10 = f + 30 * e
+        assert tile_affines[2] == (a, b, c, d, e, expected_f_10)
+
+        # Tile (1,1): phys_rs=30, phys_cs=30
+        expected_c_11 = c + 30 * a
+        expected_f_11 = f + 30 * e
+        assert tile_affines[3] == (a, b, expected_c_11, d, e, expected_f_11)
+
+    def test_output_has_original_affine(self):
+        """The assembled output raster uses the full (un-shifted) affine."""
+        raster = _make_raster(64, 64, affine=_TEST_AFFINE)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.affine == _TEST_AFFINE
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — metadata preservation
+# ---------------------------------------------------------------------------
+
+
+class TestHaloMetadataPreservation:
+    def test_affine_preserved(self):
+        custom_affine = (5.0, 0.0, 100.0, 0.0, -5.0, 200.0)
+        raster = _make_raster(32, 32, affine=custom_affine)
+        plan = _make_halo_plan(16, 16, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.affine == custom_affine
+
+    def test_nodata_preserved(self):
+        raster = _make_raster(32, 32, nodata=-9999.0)
+        plan = _make_halo_plan(16, 16, halo=1)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.nodata == -9999.0
+
+    def test_crs_preserved(self):
+        raster = _make_raster(32, 32)
+        plan = _make_halo_plan(16, 16, halo=1)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.crs == raster.crs
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int16, np.int32, np.float32, np.float64])
+    def test_dtype_roundtrip(self, dtype):
+        raster = _make_raster(32, 32, dtype=dtype)
+        plan = _make_halo_plan(16, 16, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.dtype == np.dtype(dtype)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_nodata_positions_preserved(self):
+        """Nodata sentinel values at known positions survive halo tiling."""
+        data = _RNG.random((64, 64)).astype(np.float32)
+        data[0, 0] = -9999.0
+        data[31, 31] = -9999.0
+        data[63, 63] = -9999.0
+        raster = from_numpy(data, nodata=-9999.0, affine=_TEST_AFFINE)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        rd = result.to_numpy()
+        assert rd[0, 0] == -9999.0
+        assert rd[31, 31] == -9999.0
+        assert rd[63, 63] == -9999.0
+        assert result.nodata == -9999.0
+
+    def test_nan_nodata_preserved(self):
+        """NaN nodata in float rasters is preserved through halo tiling."""
+        data = _RNG.random((32, 32)).astype(np.float32)
+        data[5, 5] = np.nan
+        data[20, 20] = np.nan
+        raster = from_numpy(data, nodata=float("nan"), affine=_TEST_AFFINE)
+        plan = _make_halo_plan(16, 16, halo=1)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.nodata is not None and np.isnan(result.nodata)
+        assert np.isnan(result.to_numpy()[5, 5])
+        assert np.isnan(result.to_numpy()[20, 20])
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — halo=0 matches dispatch_tiled
+# ---------------------------------------------------------------------------
+
+
+class TestHaloZeroMatchesDispatchTiled:
+    def test_halo_zero_matches_dispatch_tiled_identity(self):
+        """When halo=0, dispatch_tiled_halo produces the same result as
+        dispatch_tiled for an identity op."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan_halo = _make_halo_plan(32, 32, halo=0)
+        plan_plain = _make_tiled_plan(32, 32)
+
+        result_halo = dispatch_tiled_halo(raster, lambda r: r, plan_halo)
+        result_plain = dispatch_tiled(raster, lambda r: r, plan_plain)
+        np.testing.assert_array_equal(result_halo.to_numpy(), result_plain.to_numpy())
+
+    def test_halo_zero_matches_dispatch_tiled_doubling(self):
+        """halo=0 with a doubling op matches dispatch_tiled."""
+        raster = _make_raster(50, 50, dtype=np.float32)
+        plan_halo = _make_halo_plan(32, 32, halo=0)
+        plan_plain = _make_tiled_plan(32, 32)
+
+        def double_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(
+                r.to_numpy() * 2,
+                nodata=r.nodata,
+                affine=r.affine,
+                crs=r.crs,
+            )
+
+        result_halo = dispatch_tiled_halo(raster, double_op, plan_halo)
+        result_plain = dispatch_tiled(raster, double_op, plan_plain)
+        np.testing.assert_array_equal(result_halo.to_numpy(), result_plain.to_numpy())
+
+    def test_halo_zero_multiband(self):
+        """halo=0 multiband matches dispatch_tiled."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32)
+        plan_halo = _make_halo_plan(32, 32, halo=0)
+        plan_plain = _make_tiled_plan(32, 32)
+
+        result_halo = dispatch_tiled_halo(raster, lambda r: r, plan_halo)
+        result_plain = dispatch_tiled(raster, lambda r: r, plan_plain)
+        np.testing.assert_array_equal(result_halo.to_numpy(), result_plain.to_numpy())
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestHaloDiagnostics:
+    def test_tiled_halo_has_runtime_event(self):
+        raster = _make_raster(64, 64)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        runtime_events = [
+            ev for ev in result.diagnostics if ev.kind == RasterDiagnosticKind.RUNTIME
+        ]
+        assert len(runtime_events) >= 1
+        evt = runtime_events[-1]
+        assert "dispatch_tiled_halo" in evt.detail
+        assert "tiles=" in evt.detail
+        assert "halo=" in evt.detail
+
+    def test_diagnostic_includes_halo_value(self):
+        """The diagnostic detail string contains the actual halo value."""
+        raster = _make_raster(32, 32)
+        plan = _make_halo_plan(16, 16, halo=5)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        runtime_events = [
+            ev for ev in result.diagnostics if ev.kind == RasterDiagnosticKind.RUNTIME
+        ]
+        assert any("halo=5" in ev.detail for ev in runtime_events)
+
+    def test_whole_path_no_tiling_diagnostic(self):
+        """WHOLE path delegates to op_fn -- no tiling diagnostic appended."""
+        raster = _make_raster(32, 32)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, _WHOLE_PLAN)
+        tiling_events = [
+            ev
+            for ev in result.diagnostics
+            if ev.kind == RasterDiagnosticKind.RUNTIME and "dispatch_tiled_halo" in ev.detail
+        ]
+        assert len(tiling_events) == 0
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — error handling
+# ---------------------------------------------------------------------------
+
+
+class TestHaloErrorHandling:
+    def test_tiled_plan_without_tile_shape_raises(self):
+        bad_plan = RasterPlan(
+            strategy=TilingStrategy.TILED,
+            tile_shape=None,
+            halo=2,
+            n_tiles=0,
+            estimated_vram_per_tile=0,
+        )
+        raster = _make_raster(32, 32)
+
+        with pytest.raises(ValueError, match="tile_shape is None"):
+            dispatch_tiled_halo(raster, lambda r: r, bad_plan)
+
+    def test_device_resident_raises(self):
+        """DEVICE-resident input on TILED path raises ValueError."""
+        from vibespatial.residency import Residency
+
+        raster = _make_raster(32, 32)
+        raster.residency = Residency.DEVICE
+        plan = _make_halo_plan(16, 16, halo=2)
+
+        with pytest.raises(ValueError, match="HOST-resident"):
+            dispatch_tiled_halo(raster, lambda r: r, plan)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_halo — constant-value and all-nodata edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestHaloConstantAndAllNodata:
+    def test_constant_value_raster(self):
+        raster = _make_raster(64, 64, fill=42.0, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=3)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        np.testing.assert_array_equal(result.to_numpy(), 42.0)
+
+    def test_all_nodata_raster(self):
+        data = np.full((32, 32), -9999.0, dtype=np.float32)
+        raster = from_numpy(data, nodata=-9999.0, affine=_TEST_AFFINE)
+        plan = _make_halo_plan(16, 16, halo=2)
+
+        result = dispatch_tiled_halo(raster, lambda r: r, plan)
+        assert result.nodata == -9999.0
+        np.testing.assert_array_equal(result.to_numpy(), -9999.0)
