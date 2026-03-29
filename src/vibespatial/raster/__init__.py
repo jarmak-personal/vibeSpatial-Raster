@@ -123,6 +123,9 @@ __all__ = [
     "plan_from_metadata",
     "dispatch_per_band_gpu",
     "dispatch_per_band_cpu",
+    # Tiling engine (vibeSpatial-fx3.2)
+    "dispatch_tiled",
+    "dispatch_tiled_binary",
     # Memory pool management (ADR-0040)
     "configure_memory_pool",
     "memory_pool_stats",
@@ -248,6 +251,11 @@ def __getattr__(name):
         from vibespatial.raster import dispatch
 
         return getattr(dispatch, name)
+    # Tiling engine (vibeSpatial-fx3.2)
+    if name in ("dispatch_tiled", "dispatch_tiled_binary"):
+        from vibespatial.raster import tiling
+
+        return getattr(tiling, name)
     # Memory pool management (ADR-0040)
     if name in ("configure_memory_pool", "memory_pool_stats", "free_pool_memory"):
         from vibespatial.raster import memory

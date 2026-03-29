@@ -25,6 +25,8 @@ src/vibespatial/raster/
 ├── buffers.py           # OwnedRasterArray, TilingStrategy, RasterPlan, GridSpec, ZonalSpec, PolygonizeSpec, from_numpy/from_device
 ├── dispatch.py          # VRAM budget (available_vram_bytes, max_bands_for_budget), raster plan analysis
 │                        #   (analyze_raster_plan, plan_from_metadata), per-band GPU/CPU dispatch
+├── tiling.py            # Tiling execution engine (dispatch_tiled, dispatch_tiled_binary) for large rasters
+├── memory.py            # RMM memory pool management (configure_memory_pool, memory_pool_stats, free_pool_memory)
 ├── io.py                # Read/write via rasterio (HYBRID path)
 ├── nvimgcodec_io.py     # GPU-native decode via nvImageCodec
 ├── geokeys.py           # GeoTIFF GeoKey parsing
@@ -51,7 +53,7 @@ src/vibespatial/raster/
     ├── polygonize.py    # Marching-squares classify + emit
     └── resample.py      # Nearest/bilinear/bicubic resampling (dtype-templated)
 
-tests/                   # 31 test files
+tests/                   # 32 test files
 scripts/
 ├── bench.py             # Benchmarking script for raster operations
 └── check_zero_copy.py   # Zero-copy compliance linter (ZCOPY001-003)
