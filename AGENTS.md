@@ -22,7 +22,9 @@ GPU-first raster processing extension for [vibespatial](https://github.com/jarma
 ```
 src/vibespatial/raster/
 ├── __init__.py          # Lazy-import facade, public API (__all__)
-├── buffers.py           # OwnedRasterArray, GridSpec, ZonalSpec, PolygonizeSpec, from_numpy/from_device
+├── buffers.py           # OwnedRasterArray, TilingStrategy, RasterPlan, GridSpec, ZonalSpec, PolygonizeSpec, from_numpy/from_device
+├── dispatch.py          # VRAM budget (available_vram_bytes, max_bands_for_budget), raster plan analysis
+│                        #   (analyze_raster_plan, plan_from_metadata), per-band GPU/CPU dispatch
 ├── io.py                # Read/write via rasterio (HYBRID path)
 ├── nvimgcodec_io.py     # GPU-native decode via nvImageCodec
 ├── geokeys.py           # GeoTIFF GeoKey parsing
@@ -49,7 +51,7 @@ src/vibespatial/raster/
     ├── polygonize.py    # Marching-squares classify + emit
     └── resample.py      # Nearest/bilinear/bicubic resampling (dtype-templated)
 
-tests/                   # 19 test files (~6,900 lines)
+tests/                   # 31 test files
 scripts/
 ├── bench.py             # Benchmarking script for raster operations
 └── check_zero_copy.py   # Zero-copy compliance linter (ZCOPY001-003)

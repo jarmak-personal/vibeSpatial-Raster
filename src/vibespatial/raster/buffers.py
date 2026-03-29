@@ -148,6 +148,33 @@ class RasterWindow:
 
 
 # ---------------------------------------------------------------------------
+# IO analysis plan (ADR vibeSpatial-fx3.1)
+# ---------------------------------------------------------------------------
+
+
+class TilingStrategy(StrEnum):
+    """Processing strategy for a raster given VRAM constraints."""
+
+    WHOLE = "whole"  # Entire raster fits in VRAM
+    TILED = "tiled"  # Must be spatially tiled
+
+
+@dataclass(frozen=True)
+class RasterPlan:
+    """Result of analyzing a raster against a VRAM budget.
+
+    Describes whether the raster can be processed whole or must be spatially
+    tiled, and provides tile dimensions when tiling is needed.
+    """
+
+    strategy: TilingStrategy
+    tile_shape: tuple[int, int] | None  # (tile_H, tile_W) or None for whole
+    halo: int  # overlap pixels for stencil ops
+    n_tiles: int  # total tiles (0 for whole)
+    estimated_vram_per_tile: int  # bytes per tile
+
+
+# ---------------------------------------------------------------------------
 # Interop spec types (ADR-0038)
 # ---------------------------------------------------------------------------
 

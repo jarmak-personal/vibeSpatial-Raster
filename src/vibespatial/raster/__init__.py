@@ -22,8 +22,10 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticEvent,
     RasterDiagnosticKind,
     RasterMetadata,
+    RasterPlan,
     RasterTileSpec,
     RasterWindow,
+    TilingStrategy,
     ZonalSpec,
     ZonalStatistic,
     from_device,
@@ -37,8 +39,10 @@ __all__ = [
     "RasterDiagnosticEvent",
     "RasterDiagnosticKind",
     "RasterMetadata",
+    "RasterPlan",
     "RasterTileSpec",
     "RasterWindow",
+    "TilingStrategy",
     "GridSpec",
     "ZonalSpec",
     "ZonalStatistic",
@@ -115,6 +119,8 @@ __all__ = [
     # Dispatch / VRAM budget
     "available_vram_bytes",
     "max_bands_for_budget",
+    "analyze_raster_plan",
+    "plan_from_metadata",
     "dispatch_per_band_gpu",
     "dispatch_per_band_cpu",
     # Memory pool management (ADR-0040)
@@ -234,6 +240,8 @@ def __getattr__(name):
     if name in (
         "available_vram_bytes",
         "max_bands_for_budget",
+        "analyze_raster_plan",
+        "plan_from_metadata",
         "dispatch_per_band_gpu",
         "dispatch_per_band_cpu",
     ):

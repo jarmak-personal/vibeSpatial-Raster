@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from vibespatial.raster.buffers import OwnedRasterArray
+    from vibespatial.raster.buffers import OwnedRasterArray, RasterMetadata, RasterPlan
 
 __all__ = [
     "available_vram_bytes",
     "max_bands_for_budget",
+    "analyze_raster_plan",
+    "plan_from_metadata",
     "dispatch_per_band_gpu",
     "dispatch_per_band_cpu",
 ]
@@ -120,6 +122,185 @@ def max_bands_for_budget(
         return 1
 
     return max(1, budget // per_band)
+
+
+# ---------------------------------------------------------------------------
+# Raster plan analysis (vibeSpatial-fx3.1)
+# ---------------------------------------------------------------------------
+
+# Budget safety factor: reserve 30% of the headroom-adjusted VRAM for runtime
+# variance (kernel temporaries, driver bookkeeping, concurrent allocations).
+_BUDGET_SAFETY_FACTOR = 0.7
+
+# Default tile target: 4096x4096 is warp-friendly (~64 MB for float32).
+_DEFAULT_TILE_DIM = 4096
+
+# Tile dimensions must be multiples of this value for GPU warp alignment.
+_TILE_ALIGNMENT = 256
+
+# Minimum tile dimension after alignment (must be >= _TILE_ALIGNMENT).
+_MIN_TILE_DIM = _TILE_ALIGNMENT
+
+
+def analyze_raster_plan(
+    height: int,
+    width: int,
+    dtype: np.dtype,
+    *,
+    band_count: int = 1,
+    buffers_per_band: int = 2,
+    scratch_bytes: int = 0,
+    halo: int = 0,
+    vram_budget: int | None = None,
+) -> RasterPlan:
+    """Decide the processing strategy for a raster given VRAM constraints.
+
+    Parameters
+    ----------
+    height, width:
+        Spatial dimensions of the raster.
+    dtype:
+        NumPy dtype (e.g. ``np.float32``).
+    band_count:
+        Number of bands.
+    buffers_per_band:
+        Device buffers required per band (default 2: input + output).
+    scratch_bytes:
+        Additional fixed scratch memory consumed by the operation.
+    halo:
+        Overlap pixels for stencil/focal operations.  Each tile's effective
+        data area is ``(tile_H - 2*halo, tile_W - 2*halo)``.
+    vram_budget:
+        Available VRAM in bytes.  ``None`` triggers auto-detection via
+        :func:`available_vram_bytes`.
+
+    Returns
+    -------
+    RasterPlan
+        Frozen dataclass describing the strategy, tile dimensions, and
+        estimated VRAM per tile.
+    """
+    from vibespatial.raster.buffers import RasterPlan, TilingStrategy
+
+    dtype = np.dtype(dtype)
+    pixel_bytes = dtype.itemsize
+
+    # Total bytes for the full raster (all bands, all buffers).
+    full_raster_bytes = height * width * pixel_bytes * buffers_per_band * band_count
+
+    # Auto-detect VRAM when caller does not supply an explicit budget.
+    if vram_budget is None:
+        vram_budget = available_vram_bytes()
+
+    # When VRAM budget is 0 (no GPU), strategy is WHOLE -- tiling is a
+    # GPU-side concern.  CPU operations process the raster in one pass.
+    if vram_budget <= 0:
+        return RasterPlan(
+            strategy=TilingStrategy.WHOLE,
+            tile_shape=None,
+            halo=halo,
+            n_tiles=0,
+            estimated_vram_per_tile=0,
+        )
+
+    usable_budget = int(vram_budget * _BUDGET_SAFETY_FACTOR)
+
+    # Does the full raster (+ scratch) fit within the usable budget?
+    if full_raster_bytes + scratch_bytes <= usable_budget:
+        return RasterPlan(
+            strategy=TilingStrategy.WHOLE,
+            tile_shape=None,
+            halo=halo,
+            n_tiles=0,
+            estimated_vram_per_tile=full_raster_bytes + scratch_bytes,
+        )
+
+    # --- Tiled strategy ---
+    # Start from the default tile dimension and shrink until the tile fits.
+    tile_h = min(_DEFAULT_TILE_DIM, height)
+    tile_w = min(_DEFAULT_TILE_DIM, width)
+
+    # Align to _TILE_ALIGNMENT (round down, but at least _MIN_TILE_DIM).
+    tile_h = max(_MIN_TILE_DIM, (tile_h // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+    tile_w = max(_MIN_TILE_DIM, (tile_w // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+
+    # Shrink tile dims until per-tile VRAM fits in the usable budget.
+    # Each tile includes the halo border: physical tile is
+    # (tile_h + 2*halo) x (tile_w + 2*halo) pixels.  tile_shape stores
+    # the *effective* tile dimensions (without halo); the physical tile
+    # read from disk is (tile_h + 2*halo, tile_w + 2*halo).
+    while True:
+        physical_h = tile_h + 2 * halo
+        physical_w = tile_w + 2 * halo
+        tile_bytes = (
+            physical_h * physical_w * pixel_bytes * buffers_per_band * band_count + scratch_bytes
+        )
+        if tile_bytes <= usable_budget:
+            break
+        # Both dimensions at minimum — cannot shrink further.
+        if tile_h <= _MIN_TILE_DIM and tile_w <= _MIN_TILE_DIM:
+            break
+        # Halve the larger dimension (aligned).
+        if tile_h >= tile_w:
+            tile_h = max(_MIN_TILE_DIM, ((tile_h // 2) // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+        else:
+            tile_w = max(_MIN_TILE_DIM, ((tile_w // 2) // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+
+    # Recompute final physical tile dimensions and bytes.
+    physical_h = tile_h + 2 * halo
+    physical_w = tile_w + 2 * halo
+    tile_bytes = (
+        physical_h * physical_w * pixel_bytes * buffers_per_band * band_count + scratch_bytes
+    )
+
+    # Compute tile count using the effective (non-halo) area.
+    effective_h = tile_h
+    effective_w = tile_w
+    rows_of_tiles = (height + effective_h - 1) // effective_h
+    cols_of_tiles = (width + effective_w - 1) // effective_w
+    n_tiles = rows_of_tiles * cols_of_tiles
+
+    return RasterPlan(
+        strategy=TilingStrategy.TILED,
+        tile_shape=(tile_h, tile_w),
+        halo=halo,
+        n_tiles=n_tiles,
+        estimated_vram_per_tile=tile_bytes,
+    )
+
+
+def plan_from_metadata(
+    metadata: RasterMetadata,
+    *,
+    buffers_per_band: int = 2,
+    scratch_bytes: int = 0,
+    halo: int = 0,
+    vram_budget: int | None = None,
+) -> RasterPlan:
+    """Convenience wrapper: extract dimensions from :class:`RasterMetadata`.
+
+    Parameters
+    ----------
+    metadata:
+        Raster metadata (from :func:`read_raster_metadata` or
+        ``raster.metadata``).
+    buffers_per_band, scratch_bytes, halo, vram_budget:
+        Forwarded to :func:`analyze_raster_plan`.
+
+    Returns
+    -------
+    RasterPlan
+    """
+    return analyze_raster_plan(
+        height=metadata.height,
+        width=metadata.width,
+        dtype=metadata.dtype,
+        band_count=metadata.band_count,
+        buffers_per_band=buffers_per_band,
+        scratch_bytes=scratch_bytes,
+        halo=halo,
+        vram_budget=vram_budget,
+    )
 
 
 # ---------------------------------------------------------------------------
