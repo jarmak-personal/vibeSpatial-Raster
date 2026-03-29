@@ -5,10 +5,13 @@ The ``read_raster`` dispatcher tries the GPU path first (when available),
 falling back to rasterio transparently.
 
 ADR-0037: Raster IO Support and Read Paths
+ADR: vibeSpatial-fx3.6  Phase 5: Streamed windowed IO
 """
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +24,7 @@ from vibespatial.raster.buffers import (
     RasterDiagnosticKind,
     RasterMetadata,
     RasterWindow,
+    TilingStrategy,
     from_device,
     from_numpy,
 )
@@ -28,6 +32,8 @@ from vibespatial.residency import Residency, TransferTrigger
 
 if TYPE_CHECKING:
     from pyproj import CRS
+
+    from vibespatial.raster.buffers import RasterPlan
 
 
 def has_rasterio_support() -> bool:
@@ -385,3 +391,282 @@ def write_raster(
             visible_to_user=True,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Streamed windowed IO (vibeSpatial-fx3.6)
+# ---------------------------------------------------------------------------
+
+
+def process_raster_streamed(
+    input_path: str | Path,
+    output_path: str | Path,
+    op_fn: Callable[[OwnedRasterArray], OwnedRasterArray],
+    plan: RasterPlan,
+    *,
+    halo: int = 0,
+    compress: str | None = "deflate",
+    tiled: bool = True,
+    blockxsize: int = 256,
+    blockysize: int = 256,
+) -> RasterMetadata:
+    """Process a raster file tile-by-tile without loading the full raster.
+
+    Reads tiles from the input file via rasterio windowed reads, applies
+    ``op_fn`` to each tile, and writes the result to the output file via
+    rasterio windowed writes.  At no point is the full raster held in host
+    or device memory — only one tile's worth of data is live at a time.
+
+    Parameters
+    ----------
+    input_path : str or Path
+        Path to the input raster file (GeoTIFF, COG, or any rasterio-
+        supported format).
+    output_path : str or Path
+        Path to write the output raster file.
+    op_fn : Callable[[OwnedRasterArray], OwnedRasterArray]
+        The operation to apply to each tile.  Receives a tile-sized
+        ``OwnedRasterArray`` and returns a result of the same spatial
+        dimensions as the effective (non-halo) region.  When ``halo > 0``
+        the input includes halo border pixels and the dispatcher trims the
+        result to the effective region.
+    plan : RasterPlan
+        A frozen ``RasterPlan`` that controls the tiling strategy.  When
+        ``plan.strategy == WHOLE`` the entire raster is read, processed,
+        and written in one shot (the fast path).  When ``plan.strategy ==
+        TILED``, ``plan.tile_shape`` specifies the effective tile dimensions
+        ``(tile_H, tile_W)`` and the raster is streamed tile-by-tile.
+    halo : int
+        Number of overlap pixels to include around each tile for stencil
+        operations.  The result is trimmed back to the effective region
+        before writing.  Default 0 (no overlap).
+    compress : str or None
+        Compression algorithm for the output file.  Default ``"deflate"``.
+        Pass ``None`` for no compression.
+    tiled : bool
+        Whether to write tiled GeoTIFF blocks.  Default ``True``.
+    blockxsize, blockysize : int
+        GeoTIFF internal tile dimensions when ``tiled=True``.
+
+    Returns
+    -------
+    RasterMetadata
+        Metadata of the output file.
+
+    Raises
+    ------
+    ValueError
+        If ``plan.strategy`` is ``TILED`` but ``plan.tile_shape`` is ``None``.
+    ImportError
+        If rasterio is not installed.
+    """
+    _require_rasterio()
+    import rasterio
+    from rasterio.windows import Window
+
+    from vibespatial.raster.tiling import _adjust_affine, _tile_bounds
+
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    # -- WHOLE fast path: read → process → write --------------------------
+    if plan.strategy == TilingStrategy.WHOLE:
+        t0 = time.perf_counter()
+        raster = read_raster(str(input_path))
+        result = op_fn(raster)
+        write_raster(
+            output_path,
+            result,
+            compress=compress,
+            tiled=tiled,
+            blockxsize=blockxsize,
+            blockysize=blockysize,
+        )
+        elapsed = time.perf_counter() - t0
+        _whole_diag = RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"process_raster_streamed strategy=WHOLE "
+                f"path={input_path.name} elapsed={elapsed:.4f}s"
+            ),
+            residency=result.residency,
+            elapsed_seconds=elapsed,
+        )
+        result.diagnostics.append(_whole_diag)
+        process_raster_streamed._last_diagnostic = _whole_diag  # type: ignore[attr-defined]
+        return read_raster_metadata(str(output_path))
+
+    # -- TILED path: streamed windowed IO ---------------------------------
+    if plan.tile_shape is None:
+        raise ValueError(
+            "RasterPlan has strategy=TILED but tile_shape is None; this indicates a malformed plan"
+        )
+
+    t0 = time.perf_counter()
+    tile_h, tile_w = plan.tile_shape
+
+    with rasterio.open(str(input_path)) as src:
+        raster_h = src.height
+        raster_w = src.width
+        band_count = src.count
+        src_dtype = src.dtypes[0]
+        src_nodata = src.nodata
+        src_transform = src.transform
+        src_crs = _extract_crs(src)
+        affine = _affine_to_tuple(src_transform)
+
+        # Build output profile from input metadata.
+        profile = {
+            "driver": "GTiff",
+            "dtype": src_dtype,
+            "width": raster_w,
+            "height": raster_h,
+            "count": band_count,
+            "transform": src_transform,
+            "tiled": tiled,
+        }
+        if src_nodata is not None:
+            profile["nodata"] = src_nodata
+        if src.crs is not None:
+            profile["crs"] = src.crs
+        if compress is not None:
+            profile["compress"] = compress
+        if tiled:
+            profile["blockxsize"] = blockxsize
+            profile["blockysize"] = blockysize
+
+        nodata_typed = np.dtype(src_dtype).type(src_nodata) if src_nodata is not None else None
+
+        # Compute tile grid.
+        rows_of_tiles = (raster_h + tile_h - 1) // tile_h
+        cols_of_tiles = (raster_w + tile_w - 1) // tile_w
+
+        tiles_processed = 0
+
+        with rasterio.open(str(output_path), "w", **profile) as dst:
+            for tr in range(rows_of_tiles):
+                for tc in range(cols_of_tiles):
+                    # Effective bounds — the non-overlapping output region.
+                    eff_rs, eff_re, eff_cs, eff_ce = _tile_bounds(
+                        tr,
+                        tc,
+                        tile_h,
+                        tile_w,
+                        raster_h,
+                        raster_w,
+                    )
+
+                    if halo > 0:
+                        # Physical bounds: expand by halo, clamped.
+                        phys_rs = max(0, eff_rs - halo)
+                        phys_re = min(raster_h, eff_re + halo)
+                        phys_cs = max(0, eff_cs - halo)
+                        phys_ce = min(raster_w, eff_ce + halo)
+                    else:
+                        phys_rs, phys_re = eff_rs, eff_re
+                        phys_cs, phys_ce = eff_cs, eff_ce
+
+                    phys_height = phys_re - phys_rs
+                    phys_width = phys_ce - phys_cs
+
+                    # Read the physical tile via windowed read.
+                    read_window = Window(
+                        col_off=phys_cs,
+                        row_off=phys_rs,
+                        width=phys_width,
+                        height=phys_height,
+                    )
+                    tile_data = src.read(window=read_window)
+                    # tile_data shape: (bands, phys_height, phys_width)
+
+                    # Squeeze single-band to 2D for consistency with
+                    # OwnedRasterArray conventions.
+                    if tile_data.shape[0] == 1:
+                        tile_data = tile_data[0]
+
+                    # Adjust affine to the physical tile origin.
+                    tile_affine = _adjust_affine(
+                        affine,
+                        row_offset=phys_rs,
+                        col_offset=phys_cs,
+                    )
+
+                    # Wrap as OwnedRasterArray (HOST-resident).
+                    tile_raster = from_numpy(
+                        tile_data,
+                        nodata=nodata_typed,
+                        affine=tile_affine,
+                        crs=src_crs,
+                    )
+
+                    # Apply the user operation.
+                    tile_result = op_fn(tile_raster)
+
+                    # Materialize result to host.
+                    tile_host = tile_result.to_numpy()
+
+                    # Trim halo from result if present.
+                    if halo > 0:
+                        top_trim = eff_rs - phys_rs
+                        left_trim = eff_cs - phys_cs
+                        eff_height = eff_re - eff_rs
+                        eff_width = eff_ce - eff_cs
+
+                        if tile_host.ndim == 3:
+                            tile_host = tile_host[
+                                :,
+                                top_trim : top_trim + eff_height,
+                                left_trim : left_trim + eff_width,
+                            ]
+                        else:
+                            tile_host = tile_host[
+                                top_trim : top_trim + eff_height,
+                                left_trim : left_trim + eff_width,
+                            ]
+
+                    # Ensure 3D for rasterio write (bands, H, W).
+                    write_data = tile_host
+                    if write_data.ndim == 2:
+                        write_data = write_data[np.newaxis, :, :]
+
+                    # Write to the effective window in the output file.
+                    eff_height = eff_re - eff_rs
+                    eff_width = eff_ce - eff_cs
+                    write_window = Window(
+                        col_off=eff_cs,
+                        row_off=eff_rs,
+                        width=eff_width,
+                        height=eff_height,
+                    )
+                    dst.write(write_data, window=write_window)
+
+                    # Release tile references.
+                    del tile_raster, tile_result, tile_host, tile_data, write_data
+
+                    tiles_processed += 1
+
+    elapsed = time.perf_counter() - t0
+
+    out_meta = read_raster_metadata(str(output_path))
+
+    # Attach a diagnostic event to the returned metadata object.  Since
+    # RasterMetadata is a frozen dataclass without a diagnostics list we
+    # log to stderr-style detail string in the returned metadata and rely
+    # on the caller to inspect the elapsed time in the metadata itself.
+    # For visibility we create a standalone event that callers who capture
+    # the return value can introspect.
+    _streamed_last_diagnostic = RasterDiagnosticEvent(
+        kind=RasterDiagnosticKind.RUNTIME,
+        detail=(
+            f"process_raster_streamed strategy=TILED "
+            f"tiles={tiles_processed} tile_shape=({tile_h},{tile_w}) "
+            f"halo={halo} raster_shape=({raster_h},{raster_w}) "
+            f"path={input_path.name} elapsed={elapsed:.4f}s"
+        ),
+        residency=Residency.HOST,
+        elapsed_seconds=elapsed,
+    )
+    # Store as module-level for diagnostic introspection.
+    process_raster_streamed._last_diagnostic = _streamed_last_diagnostic  # type: ignore[attr-defined]
+
+    return out_meta

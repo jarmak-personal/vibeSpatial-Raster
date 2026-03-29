@@ -54,6 +54,7 @@ __all__ = [
     "read_raster",
     "read_raster_metadata",
     "write_raster",
+    "process_raster_streamed",
     "has_rasterio_support",
     "has_nvimgcodec_support",
     # Algebra
@@ -146,6 +147,7 @@ def __getattr__(name):
         "read_raster",
         "read_raster_metadata",
         "write_raster",
+        "process_raster_streamed",
         "has_rasterio_support",
         "has_nvimgcodec_support",
     ):
