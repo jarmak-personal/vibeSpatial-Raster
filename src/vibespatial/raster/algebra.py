@@ -122,12 +122,13 @@ def _binary_op_gpu(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_fu
 
     # Determine compute dtype
     out_dtype = np.result_type(a.dtype, b.dtype)
-    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
-        dtype_name = "float"
-        compute_dtype = np.float32
-    else:
+    if out_dtype.itemsize > 4 or (np.issubdtype(out_dtype, np.integer) and out_dtype.itemsize >= 4):
         dtype_name = "double"
         compute_dtype = np.float64
+    else:
+        # float32, float16, and narrow integers (<=16-bit) → compute in float32
+        dtype_name = "float"
+        compute_dtype = np.float32
 
     # Cast to compute dtype (zero-copy if already correct)
     da = da.astype(compute_dtype, copy=False)
@@ -253,7 +254,7 @@ def _binary_op_gpu(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_fu
         )
 
         # Single scalar D2H to check if any inf/nan was produced
-        has_bad = int(d_has_bad.get())
+        has_bad = int(d_has_bad.get().item())
         if has_bad:
             if np.issubdtype(out_dtype, np.floating):
                 # Leave inf/nan in place; they serve as the nodata sentinel
@@ -1100,12 +1101,12 @@ def _raster_expression_gpu(
     t0 = time.perf_counter()
 
     # Determine compute dtype
-    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
-        dtype_name = "float"
-        compute_dtype = np.float32
-    else:
+    if out_dtype.itemsize > 4 or (np.issubdtype(out_dtype, np.integer) and out_dtype.itemsize >= 4):
         dtype_name = "double"
         compute_dtype = np.float64
+    else:
+        dtype_name = "float"
+        compute_dtype = np.float32
 
     # Ordered variable names
     var_names = tuple(sorted(rasters.keys()))
@@ -1253,10 +1254,10 @@ def _raster_expression_cpu(
     flat_shape = shape if len(shape) == 2 else shape[-2:]
 
     # Determine compute dtype
-    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
-        compute_dtype = np.float32
-    else:
+    if out_dtype.itemsize > 4 or (np.issubdtype(out_dtype, np.integer) and out_dtype.itemsize >= 4):
         compute_dtype = np.float64
+    else:
+        compute_dtype = np.float32
 
     # Build numpy namespace for eval
     numpy_funcs = {
@@ -1342,12 +1343,12 @@ def _raster_band_expression_gpu(
     t0 = time.perf_counter()
 
     # Determine compute dtype
-    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
-        dtype_name = "float"
-        compute_dtype = np.float32
-    else:
+    if out_dtype.itemsize > 4 or (np.issubdtype(out_dtype, np.integer) and out_dtype.itemsize >= 4):
         dtype_name = "double"
         compute_dtype = np.float64
+    else:
+        dtype_name = "float"
+        compute_dtype = np.float32
 
     # Identify which rasters are band-indexed vs standalone single-band
     band_indexed_vars: set[str] = set()
@@ -1684,10 +1685,10 @@ def _raster_band_expression_cpu(
     flat_shape = (height, width)
 
     # Determine compute dtype
-    if np.issubdtype(out_dtype, np.floating) and out_dtype.itemsize <= 4:
-        compute_dtype = np.float32
-    else:
+    if out_dtype.itemsize > 4 or (np.issubdtype(out_dtype, np.integer) and out_dtype.itemsize >= 4):
         compute_dtype = np.float64
+    else:
+        compute_dtype = np.float32
 
     # Rewrite expression: a[3] -> a_band3
     rewritten = _rewrite_band_expression(expression, band_refs)
@@ -1892,10 +1893,11 @@ def raster_expression(
 
     # Determine output dtype (float32 if all inputs are float32, else float64)
     dtypes = [r.dtype for r in rasters.values()]
-    if all(np.issubdtype(d, np.floating) and np.dtype(d).itemsize <= 4 for d in dtypes):
-        out_dtype = np.dtype(np.float32)
-    else:
+    combined = np.result_type(*dtypes)
+    if combined.itemsize > 4 or (np.issubdtype(combined, np.integer) and combined.itemsize >= 4):
         out_dtype = np.dtype(np.float64)
+    else:
+        out_dtype = np.dtype(np.float32)
 
     # Determine nodata
     nodata_vals = [r.nodata for r in rasters.values() if r.nodata is not None]

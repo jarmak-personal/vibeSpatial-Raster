@@ -337,34 +337,27 @@ class TestContext:
 
     @property
     def single_band(self):
-        """First band as float32 OwnedRasterArray."""
+        """First band via public read_raster (native dtype & nodata)."""
 
         def build():
-            from vibespatial.raster import from_numpy
+            from vibespatial.raster import read_raster
 
-            data = self.raster.to_numpy()
-            band = data[0] if data.ndim == 3 else data
-            return from_numpy(
-                band.astype(np.float32),
-                nodata=np.float32("nan"),
-                affine=self.raster.affine,
-                crs=self.raster.crs,
-            )
+            return read_raster(str(self.sample_path), bands=[1])
 
         return self._get("single_band", build)
 
     @property
     def second_raster(self):
-        """Shifted copy for binary algebra ops."""
+        """Shifted copy for binary algebra ops (native dtype)."""
 
         def build():
             from vibespatial.raster import from_numpy
 
             data = self.single_band.to_numpy()
-            shifted = np.roll(data, 100, axis=1).copy()
+            shifted = np.roll(data, 100, axis=-1).copy()
             return from_numpy(
                 shifted,
-                nodata=np.float32("nan"),
+                nodata=self.single_band.nodata,
                 affine=self.single_band.affine,
                 crs=self.single_band.crs,
             )
@@ -379,7 +372,8 @@ class TestContext:
             from vibespatial.raster import from_numpy
 
             data = self.single_band.to_numpy()
-            mask = (data > np.nanmedian(data)).astype(np.uint8)
+            median = np.nanmedian(data) if np.issubdtype(data.dtype, np.floating) else np.median(data)
+            mask = (data > median).astype(np.uint8)
             return from_numpy(
                 mask,
                 nodata=None,
@@ -455,7 +449,7 @@ class TestContext:
 # ---------------------------------------------------------------------------
 
 
-def _chk_raster(result, ctx):
+def _chk_raster(result, _ctx):
     """Assert result is a valid OwnedRasterArray with non-degenerate data."""
     assert hasattr(result, "to_numpy"), f"Expected OwnedRasterArray, got {type(result).__name__}"
     d = result.to_numpy()
@@ -833,7 +827,7 @@ def _op_zonal():
         import pandas as pd
 
         z = ctx.zones.to_numpy().ravel()
-        v = ctx.single_band.to_numpy().ravel()
+        v = ctx.single_band.to_numpy().ravel().astype(np.float64)
         valid = ~np.isnan(v) & (z > 0)
         df = pd.DataFrame({"zone": z[valid], "value": v[valid]})
         return df.groupby("zone")["value"].agg(["count", "sum", "mean", "min", "max"])
