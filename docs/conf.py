@@ -3,7 +3,7 @@
 project = "vibespatial-raster"
 copyright = "2026, vibespatial Contributors"
 author = "vibespatial Contributors"
-release = "0.1.6"
+release = "0.1.7"
 
 extensions = [
     "myst_parser",
